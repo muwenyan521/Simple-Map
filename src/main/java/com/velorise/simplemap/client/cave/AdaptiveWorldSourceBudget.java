@@ -11,7 +11,7 @@ package com.velorise.simplemap.client.cave;
 final class AdaptiveWorldSourceBudget {
     static final long MIB = 1L << 20;
     static final long MIN_TARGET = 32L * MIB;
-    static final long MAX_TARGET = 512L * MIB;
+    static final long MAX_TARGET = 256L * MIB;
 
     private AdaptiveWorldSourceBudget() {
     }
@@ -25,32 +25,42 @@ final class AdaptiveWorldSourceBudget {
         long headroom = Math.max(0L, max - used);
         double pressure = Math.min(1.0D, used / (double) max);
 
-        long target = Math.max(64L * MIB, Math.min(MAX_TARGET, max / 10L));
-        if (pressure >= 0.94D) target /= 8L;
-        else if (pressure >= 0.89D) target /= 4L;
-        else if (pressure >= 0.82D) target /= 2L;
+        long target = Math.max(64L * MIB, Math.min(MAX_TARGET, max / 16L));
+        if (pressure >= 0.92D) target /= 8L;
+        else if (pressure >= 0.86D) target /= 4L;
+        else if (pressure >= 0.78D) target /= 2L;
         target = Math.min(target, Math.max(MIN_TARGET, headroom / 2L));
         target = clamp(target, MIN_TARGET, MAX_TARGET);
 
         int cpu = Math.max(1, processors);
-        // A fullscreen page is an atomic 16-chunk transaction. The previous
-        // 16-20 source ceiling let the page scheduler open four pages but denied
-        // leaves in three of them; those pages warmed cache without publishing.
-        // Healthy cold builds now reserve several whole pages, while the same heap
-        // pressure thresholds still collapse concurrency before a GC spiral.
-        int baseInFlight = Math.max(32, Math.min(256, cpu * 12));
-        if (pressure >= 0.94D) baseInFlight = 16;
-        else if (pressure >= 0.89D) baseInFlight = Math.max(32, baseInFlight / 4);
-        else if (pressure >= 0.82D) baseInFlight = Math.max(64, baseInFlight / 2);
+        /*
+         * PASS139: decoded-source admission is a disk/CPU pipeline, not a "more is
+         * always faster" queue. PASS138 allowed up to 288 simultaneous chunkMap
+         * reads (exactly eight 6x6 Cave source pages). The latest run then recorded
+         * ANVIL_READ avg ~=52 ms, max >3.2 s and hundreds of completions in one
+         * sample while frame time spiked. Keep enough overlap for NVMe latency, but
+         * stop flooding Minecraft's RegionFileStorage/IO queue.
+         */
+        /*
+         * PASS141: a visible 64x64 Cave page is exactly sixteen Minecraft chunks.
+         * The PASS139/PASS140 heap-pressure floor could contract async source IO to
+         * six chunks, making one page transaction mathematically impossible while a
+         * handful of durable native-archive reads were active. Xaero's world-save
+         * reader starts all sixteen NBT futures for one 4x4 MapTileChunk together.
+         * Keep at least one complete visible page plus a bounded durable overlap;
+         * CPU decode/fanout remains separately limited by PriorityDecodeExecutor.
+         */
+        int baseInFlight = Math.max(28, Math.min(32, cpu * 2));
+        if (pressure >= 0.92D) baseInFlight = 28;
+        else if (pressure >= 0.86D) baseInFlight = 30;
+        else if (pressure >= 0.78D) baseInFlight = Math.max(30, baseInFlight);
 
-        // Foreground cave/surface requests must not be starved by speculative
-        // viewport prefetch. Backlog can expand admission slightly while heap is
-        // healthy, but never beyond the CPU-derived ceiling.
-        int demand = Math.max(0, pendingForeground) + Math.max(0, pendingBackground) / 4;
-        int maximumInFlight = Math.min(288,
-                baseInFlight + Math.min(32, demand / 8));
-        int maximumPrefetch = Math.max(4,
-                maximumInFlight / (pressure >= 0.82D ? 8 : 4));
+        int demand = Math.max(0, pendingForeground)
+                + Math.max(0, pendingBackground) / 4;
+        int maximumInFlight = Math.min(32,
+                baseInFlight + Math.min(4, demand / 16));
+        int maximumPrefetch = Math.max(1,
+                Math.min(4, maximumInFlight / (pressure >= 0.78D ? 10 : 8)));
         return new Snapshot(target, maximumInFlight, maximumPrefetch, pressure, headroom);
     }
 

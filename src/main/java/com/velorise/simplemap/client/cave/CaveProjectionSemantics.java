@@ -62,4 +62,5 @@ final class CaveProjectionSemantics {
         int outAlpha = Math.max((base >>> 24) & 0xFF, (overlay >>> 24) & 0xFF);
         return (outAlpha << 24) | (blue << 16) | (green << 8) | red;
     }
+
 }

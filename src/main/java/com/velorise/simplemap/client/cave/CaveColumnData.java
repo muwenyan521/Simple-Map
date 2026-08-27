@@ -15,6 +15,7 @@ public final class CaveColumnData {
     public static final byte FLAG_WATER = 1;
     public static final byte FLAG_FLUID = 1 << 1;
     public static final byte FLAG_EMISSIVE = 1 << 2;
+    public static final byte FLUID_FLAG_EMISSIVE = 1;
     public static final int MAX_RUNS = 255;
 
     private static final CaveColumnData EMPTY = new CaveColumnData(
@@ -25,6 +26,17 @@ public final class CaveColumnData {
     private final short[] bottomY;
     private final int[] colors;
     private final byte[] flags;
+    /** Semantic presentation facts; never pre-composited into {@link #colors}. */
+    private final int[] fluidColors;
+    private final byte[] fluidAlpha;
+    private final short[] fluidY;
+    private final byte[] fluidLight;
+    private final byte[] fluidDepth;
+    private final byte[] fluidFlags;
+    private final int[] emissiveColors;
+    private final byte[] emissiveAlpha;
+    private final short[] emissiveY;
+    private final byte[] emissiveLight;
     private final int count;
     private final short scannedMinimumY;
     private final short scannedMaximumY;
@@ -40,11 +52,39 @@ public final class CaveColumnData {
             int[] colors, byte[] flags, int count,
             int scannedMinimumY, int scannedMaximumY,
             boolean fullHeightComplete) {
+        this(topY, bottomY, colors, flags,
+                new int[Math.max(0, count)], new byte[Math.max(0, count)],
+                new short[Math.max(0, count)], new byte[Math.max(0, count)],
+                new byte[Math.max(0, count)], new byte[Math.max(0, count)],
+                new int[Math.max(0, count)],
+                new byte[Math.max(0, count)], new short[Math.max(0, count)],
+                new byte[Math.max(0, count)], count, scannedMinimumY,
+                scannedMaximumY, fullHeightComplete);
+    }
+
+    public CaveColumnData(short[] topY, short[] bottomY,
+            int[] colors, byte[] flags,
+            int[] fluidColors, byte[] fluidAlpha, short[] fluidY,
+            byte[] fluidLight, byte[] fluidDepth, byte[] fluidFlags,
+            int[] emissiveColors, byte[] emissiveAlpha, short[] emissiveY,
+            byte[] emissiveLight, int count,
+            int scannedMinimumY, int scannedMaximumY,
+            boolean fullHeightComplete) {
         int safeCount = Math.max(0, Math.min(MAX_RUNS, count));
         this.topY = Arrays.copyOf(topY, safeCount);
         this.bottomY = Arrays.copyOf(bottomY, safeCount);
         this.colors = Arrays.copyOf(colors, safeCount);
         this.flags = Arrays.copyOf(flags, safeCount);
+        this.fluidColors = Arrays.copyOf(fluidColors, safeCount);
+        this.fluidAlpha = Arrays.copyOf(fluidAlpha, safeCount);
+        this.fluidY = Arrays.copyOf(fluidY, safeCount);
+        this.fluidLight = Arrays.copyOf(fluidLight, safeCount);
+        this.fluidDepth = Arrays.copyOf(fluidDepth, safeCount);
+        this.fluidFlags = Arrays.copyOf(fluidFlags, safeCount);
+        this.emissiveColors = Arrays.copyOf(emissiveColors, safeCount);
+        this.emissiveAlpha = Arrays.copyOf(emissiveAlpha, safeCount);
+        this.emissiveY = Arrays.copyOf(emissiveY, safeCount);
+        this.emissiveLight = Arrays.copyOf(emissiveLight, safeCount);
         this.count = safeCount;
         this.scannedMinimumY = clampShort(scannedMinimumY);
         this.scannedMaximumY = clampShort(scannedMaximumY);
@@ -92,6 +132,17 @@ public final class CaveColumnData {
     public byte flags(int index) {
         return flags[index];
     }
+
+    public int fluidColor(int index) { return fluidColors[index]; }
+    public byte fluidAlpha(int index) { return fluidAlpha[index]; }
+    public short fluidY(int index) { return fluidY[index]; }
+    public byte fluidLight(int index) { return fluidLight[index]; }
+    public byte fluidDepth(int index) { return fluidDepth[index]; }
+    public byte fluidFlags(int index) { return fluidFlags[index]; }
+    public int emissiveColor(int index) { return emissiveColors[index]; }
+    public byte emissiveAlpha(int index) { return emissiveAlpha[index]; }
+    public short emissiveY(int index) { return emissiveY[index]; }
+    public byte emissiveLight(int index) { return emissiveLight[index]; }
 
     /**
      * Selects the most representative cavity for the 2D Full Cave projection.
@@ -387,7 +438,17 @@ public final class CaveColumnData {
             if (topY[i] != other.topY[i]
                     || bottomY[i] != other.bottomY[i]
                     || colors[i] != other.colors[i]
-                    || flags[i] != other.flags[i]) return false;
+                    || flags[i] != other.flags[i]
+                    || fluidColors[i] != other.fluidColors[i]
+                    || fluidAlpha[i] != other.fluidAlpha[i]
+                    || fluidY[i] != other.fluidY[i]
+                    || fluidLight[i] != other.fluidLight[i]
+                    || fluidDepth[i] != other.fluidDepth[i]
+                    || fluidFlags[i] != other.fluidFlags[i]
+                    || emissiveColors[i] != other.emissiveColors[i]
+                    || emissiveAlpha[i] != other.emissiveAlpha[i]
+                    || emissiveY[i] != other.emissiveY[i]
+                    || emissiveLight[i] != other.emissiveLight[i]) return false;
         }
         return true;
     }
@@ -402,7 +463,17 @@ public final class CaveColumnData {
             if (topY[i] != other.topY[i]
                     || bottomY[i] != other.bottomY[i]
                     || colors[i] != other.colors[i]
-                    || flags[i] != other.flags[i]) return false;
+                    || flags[i] != other.flags[i]
+                    || fluidColors[i] != other.fluidColors[i]
+                    || fluidAlpha[i] != other.fluidAlpha[i]
+                    || fluidY[i] != other.fluidY[i]
+                    || fluidLight[i] != other.fluidLight[i]
+                    || fluidDepth[i] != other.fluidDepth[i]
+                    || fluidFlags[i] != other.fluidFlags[i]
+                    || emissiveColors[i] != other.emissiveColors[i]
+                    || emissiveAlpha[i] != other.emissiveAlpha[i]
+                    || emissiveY[i] != other.emissiveY[i]
+                    || emissiveLight[i] != other.emissiveLight[i]) return false;
         }
         return true;
     }
@@ -416,6 +487,16 @@ public final class CaveColumnData {
         private final short[] bottomY = new short[MAX_RUNS];
         private final int[] colors = new int[MAX_RUNS];
         private final byte[] flags = new byte[MAX_RUNS];
+        private final int[] fluidColors = new int[MAX_RUNS];
+        private final byte[] fluidAlpha = new byte[MAX_RUNS];
+        private final short[] fluidY = new short[MAX_RUNS];
+        private final byte[] fluidLight = new byte[MAX_RUNS];
+        private final byte[] fluidDepth = new byte[MAX_RUNS];
+        private final byte[] fluidFlags = new byte[MAX_RUNS];
+        private final int[] emissiveColors = new int[MAX_RUNS];
+        private final byte[] emissiveAlpha = new byte[MAX_RUNS];
+        private final short[] emissiveY = new short[MAX_RUNS];
+        private final byte[] emissiveLight = new byte[MAX_RUNS];
         private int count;
         private boolean overflowed;
 
@@ -433,6 +514,15 @@ public final class CaveColumnData {
         }
 
         public boolean add(int runTopY, int runBottomY, int color, byte runFlags) {
+            return add(runTopY, runBottomY, color, runFlags,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        public boolean add(int runTopY, int runBottomY, int color, byte runFlags,
+                int runFluidColor, int runFluidAlpha, int runFluidY,
+                int runFluidLight, int runFluidDepth, int runFluidFlags,
+                int runEmissiveColor, int runEmissiveAlpha,
+                int runEmissiveY, int runEmissiveLight) {
             if (color == 0) return false;
             short safeTop = clampShort(runTopY);
             short safeBottom = clampShort(runBottomY);
@@ -445,6 +535,16 @@ public final class CaveColumnData {
             bottomY[count] = safeBottom;
             colors[count] = color;
             flags[count] = runFlags;
+            fluidColors[count] = runFluidColor;
+            fluidAlpha[count] = (byte) clampUnsignedByte(runFluidAlpha);
+            fluidY[count] = clampShort(runFluidY);
+            fluidLight[count] = (byte) clampUnsignedByte(runFluidLight);
+            fluidDepth[count] = (byte) clampUnsignedByte(runFluidDepth);
+            fluidFlags[count] = (byte) clampUnsignedByte(runFluidFlags);
+            emissiveColors[count] = runEmissiveColor;
+            emissiveAlpha[count] = (byte) clampUnsignedByte(runEmissiveAlpha);
+            emissiveY[count] = clampShort(runEmissiveY);
+            emissiveLight[count] = (byte) clampUnsignedByte(runEmissiveLight);
             count++;
             return true;
         }
@@ -454,9 +554,16 @@ public final class CaveColumnData {
             boolean complete = reachedMinimumY && !overflowed;
             return count == 0
                     ? CaveColumnData.emptyScanned(scannedMinimumY, scannedMaximumY, complete)
-                    : new CaveColumnData(topY, bottomY, colors, flags, count,
+                    : new CaveColumnData(topY, bottomY, colors, flags,
+                            fluidColors, fluidAlpha, fluidY, fluidLight,
+                            fluidDepth, fluidFlags, emissiveColors, emissiveAlpha,
+                            emissiveY, emissiveLight, count,
                             scannedMinimumY, scannedMaximumY, complete);
         }
+    }
+
+    private static int clampUnsignedByte(int value) {
+        return Math.max(0, Math.min(255, value));
     }
 
     private static short clampShort(int value) {

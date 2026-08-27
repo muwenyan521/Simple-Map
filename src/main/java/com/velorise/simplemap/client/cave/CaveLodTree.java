@@ -534,7 +534,7 @@ final class CaveLodTree {
                 + Math.floorMod(globalPageX, 2);
         boolean covered = (node.uploadedCompleteMask & (1L << childIndex)) != 0L
                 && node.uploadedChildRevisions[childIndex]
-                        == Math.max(1L, sourceRevision);
+                        == canonicalContentRevision(sourceRevision);
         if (covered) MapResidencyManager.getInstance().touch(residencyKey(key));
         return covered;
     }
@@ -586,7 +586,14 @@ final class CaveLodTree {
                 || knownRows == null || knownRows.length < 64 || knownColumns <= 0) return;
         PageUpdateKey key = new PageUpdateKey(dimension, view, layerY,
                 globalPageX, globalPageZ);
-        long effectiveRevision = Math.max(1L, sourceRevision);
+        /*
+         * Source revisions are signed 64-bit content fingerprints, not monotonic
+         * counters. Math.max(1, revision) collapsed every negative fingerprint to
+         * the same value (1), so about half of real cave products could be mistaken
+         * for an already queued/published branch after a Top-Y or FULL transition.
+         * Preserve all non-zero bits; only zero is reserved for "no revision".
+         */
+        long effectiveRevision = canonicalContentRevision(sourceRevision);
         MapRequestLane effectiveLane = lane == null
                 ? MapRequestLane.BACKGROUND : lane;
         /*
@@ -660,6 +667,10 @@ final class CaveLodTree {
         }
     }
 
+    private static long canonicalContentRevision(long revision) {
+        return revision == 0L ? 1L : revision;
+    }
+
     /**
      * Moves current fullscreen branch inputs ahead of valid offscreen cache work.
      * Source updates are never discarded; pan only changes the bounded derive order.
@@ -709,10 +720,14 @@ final class CaveLodTree {
                 boolean current = pageInVisibleViewport(key);
                 if (current) {
                     visibleCount++;
-                    // Promote only when FULLSCREEN is actually stronger. Never
-                    // downgrade an independent MINIMAP request merely because the
-                    // same page is also inside the fullscreen viewport.
-                    if (MapRequestLane.FULLSCREEN.strongerThan(update.lane())) {
+                    /*
+                     * PASS158: visibility outranks the static lane rank. MINIMAP is
+                     * intentionally strong during gameplay, but once MapScreen owns
+                     * the screen its queued branch snapshot is merely shared cache
+                     * input. Claim the current fullscreen rectangle explicitly so a
+                     * hidden minimap backlog cannot sit ahead of visible branches.
+                     */
+                    if (update.lane() != MapRequestLane.FULLSCREEN) {
                         update = new PageUpdate(update.key(),
                                 update.pagePixels64(), update.knownRows(),
                                 update.knownColumns(), update.complete(),
@@ -732,7 +747,8 @@ final class CaveLodTree {
                  * returns. This is the lazy region hierarchy used by Xaero rather
                  * than an ever-growing global dirty transaction queue.
                  */
-                if (update.lane() == MapRequestLane.FULLSCREEN) {
+                if (update.lane() == MapRequestLane.FULLSCREEN
+                        || update.lane() == MapRequestLane.MINIMAP) {
                     update = new PageUpdate(update.key(),
                             update.pagePixels64(), update.knownRows(),
                             update.knownColumns(), update.complete(),
@@ -758,19 +774,14 @@ final class CaveLodTree {
         while (foregroundIterator.hasNext()) {
             NodeKey key = foregroundIterator.next();
             Node node = nodes.get(key);
-            // MINIMAP is an independent live viewport and remains foreground even
-            // when the fullscreen camera is panned elsewhere.
-            if (node != null && node.requestLane == MapRequestLane.MINIMAP) {
-                visibleDirty++;
-                continue;
-            }
             if (nodeInVisibleViewport(key)) {
                 visibleDirty++;
-                promoteNodeLane(key);
+                if (node != null) node.requestLane = MapRequestLane.FULLSCREEN;
                 continue;
             }
             foregroundIterator.remove();
-            if (node != null && node.requestLane == MapRequestLane.FULLSCREEN) {
+            if (node != null && (node.requestLane == MapRequestLane.FULLSCREEN
+                    || node.requestLane == MapRequestLane.MINIMAP)) {
                 node.requestLane = MapRequestLane.BACKGROUND;
             }
             backgroundDirtyQueue.addLast(key);
@@ -780,21 +791,16 @@ final class CaveLodTree {
         while (backgroundIterator.hasNext()) {
             NodeKey key = backgroundIterator.next();
             Node node = nodes.get(key);
-            if (node != null && node.requestLane == MapRequestLane.MINIMAP) {
-                backgroundIterator.remove();
-                foregroundDirtyQueue.addFirst(key);
-                visibleDirty++;
-                continue;
-            }
             if (!nodeInVisibleViewport(key)) {
-                if (node != null && node.requestLane == MapRequestLane.FULLSCREEN) {
+                if (node != null && (node.requestLane == MapRequestLane.FULLSCREEN
+                        || node.requestLane == MapRequestLane.MINIMAP)) {
                     node.requestLane = MapRequestLane.BACKGROUND;
                 }
                 deferredDirty++;
                 continue;
             }
             backgroundIterator.remove();
-            promoteNodeLane(key);
+            if (node != null) node.requestLane = MapRequestLane.FULLSCREEN;
             if (key.level() == preferredVisibleLevel) {
                 foregroundDirtyQueue.addFirst(key);
             } else {
@@ -822,8 +828,7 @@ final class CaveLodTree {
                     prune--;
                     continue;
                 }
-                if (node.requestLane == MapRequestLane.MINIMAP
-                        || nodeInVisibleViewport(key) || node.atlasSlot >= 0) continue;
+                if (nodeInVisibleViewport(key) || node.atlasSlot >= 0) continue;
                 pruneIterator.remove();
                 dirtySet.remove(key);
                 foregroundPropagation.remove(key);
@@ -844,8 +849,8 @@ final class CaveLodTree {
             NodeKey key = foregroundPropagationIterator.next();
             Node node = nodes.get(key);
             boolean keepForeground = node != null
-                    && (node.requestLane == MapRequestLane.MINIMAP
-                            || nodeInVisibleViewport(key));
+                    && nodeInVisibleViewport(key);
+            if (keepForeground) node.requestLane = MapRequestLane.FULLSCREEN;
             if (keepForeground) continue;
             foregroundPropagationIterator.remove();
             backgroundPropagation.add(key);
@@ -1561,8 +1566,9 @@ final class CaveLodTree {
     }
 
     private static LodBranchDiskCache.Key diskKey(NodeKey key) {
-        String kind = "cave_v11_" + key.dimension + '_' + key.view.name().toLowerCase()
-                + '_' + key.layerY;
+        String kind = "cave_v" + CaveCacheSchema.CAVE_LOD_KIND_VERSION
+                + "_e" + CaveCacheSchema.EPOCH + '_' + key.dimension + '_'
+                + key.view.name().toLowerCase() + '_' + key.layerY;
         return new LodBranchDiskCache.Key(kind,
                 key.level, key.nodeX, key.nodeZ);
     }

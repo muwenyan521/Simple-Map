@@ -30,7 +30,7 @@ public final class CavePass81DemandLifecycleCheck {
         require(importer.contains("region.retainProjection(requestedView, requestedTopY)")
                         && importer.contains("existing.retireProjectionDemands()")
                         && importer.contains("demand.pageMask = pageMask")
-                        && importer.contains("requiredSourcesReady()")
+                        && importer.contains("requiredSourcesSettledForPass()")
                         && importer.contains("union of each visible page's 6x6 halo"),
                 "native-region projection demand still accumulates across pans/modes");
         require(!importer.contains("CaveView pairedView")

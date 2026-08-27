@@ -37,7 +37,7 @@ public final class CavePass85FullSourceCoalescingCheck {
                         && manager.contains("if (result.superseded())")
                         && manager.contains("restartSourceSettleWindow"),
                 "direct exact projection no longer uses one-revision coalescing");
-        require(style.contains("STYLE_SIGNATURE_VERSION = 19"),
+        require(style.contains("STYLE_SIGNATURE_VERSION = 20"),
                 "PASS86 partial Full CIMG cache remains valid");
         System.out.println("CAVE_PASS85_FULL_SOURCE_COALESCING_PASS");
     }

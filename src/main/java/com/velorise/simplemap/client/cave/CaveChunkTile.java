@@ -14,6 +14,18 @@ import java.util.BitSet;
  * commits, avoiding black flashes after nearby block changes.
  */
 public final class CaveChunkTile {
+    /**
+     * Live authority is a small idempotent lifecycle, separate from persisted
+     * column coverage. A disk tile may already be complete before the live client
+     * becomes its authority, and a repeated live repair must not erase it.
+     */
+    public enum LiveAuthorityState {
+        NONE,
+        LIVE_PENDING,
+        LIVE_SCANNING,
+        LIVE_COMPLETE
+    }
+
     public enum TileState {
         EMPTY,
         LOADING,
@@ -45,8 +57,10 @@ public final class CaveChunkTile {
     /** Changes only when CompactCaveTile-visible content changes. */
     private long archiveRevision = 1L;
     private long publishedArchiveRevision;
+    private int lastPublishedScannedCount;
     private long savedRevision;
     private int cursor;
+    private LiveAuthorityState liveAuthorityState = LiveAuthorityState.NONE;
 
     public CaveChunkTile(int chunkX, int chunkZ, boolean newLiveTile) {
         this.chunkX = chunkX;
@@ -73,7 +87,31 @@ public final class CaveChunkTile {
     }
 
     public synchronized void markArchivePublished(long value) {
-        if (value > publishedArchiveRevision) publishedArchiveRevision = value;
+        if (value > publishedArchiveRevision) {
+            publishedArchiveRevision = value;
+            lastPublishedScannedCount = scanned.cardinality();
+        }
+    }
+
+    /**
+     * PASS167: publish the projection-visible compact archive only when the chunk is
+     * a complete product. The mutable CaveChunkTile already retains 64/128/192-column
+     * scan progress, so materialising CompactCaveTile objects at those intermediate
+     * counts adds allocation and, worse, mutates page fingerprints while exact Cave
+     * products are in flight. Xaero keeps writer progress private and exposes the
+     * retained product after a bounded writer pass; follow the same ownership rule.
+     */
+    public synchronized boolean shouldPublishArchiveMilestone() {
+        if (archivePublicationCurrent(archiveRevision)
+                || scanned.isEmpty()) return false;
+        return scanned.cardinality() == COLUMN_COUNT
+                && pending.isEmpty() && recheck.isEmpty();
+    }
+
+    public synchronized int archivePublicationMilestone() {
+        return scanned.cardinality() == COLUMN_COUNT
+                && pending.isEmpty() && recheck.isEmpty()
+                ? COLUMN_COUNT : 0;
     }
 
     public synchronized long savedRevision() {
@@ -105,6 +143,32 @@ public final class CaveChunkTile {
     /** Returns true when either a missing column or a background recheck remains. */
     public synchronized boolean needsScanWork() {
         return !pending.isEmpty() || !recheck.isEmpty();
+    }
+
+    public synchronized LiveAuthorityState liveAuthorityState() {
+        return liveAuthorityState;
+    }
+
+    /** Claims live authority without invalidating any already scanned column. */
+    public synchronized boolean ensureLiveAuthority() {
+        LiveAuthorityState previous = liveAuthorityState;
+        if (isComplete() && recheck.isEmpty()) {
+            liveAuthorityState = LiveAuthorityState.LIVE_COMPLETE;
+        } else if (liveAuthorityState == LiveAuthorityState.NONE) {
+            liveAuthorityState = LiveAuthorityState.LIVE_PENDING;
+        }
+        return previous != liveAuthorityState;
+    }
+
+    public synchronized void markLiveScanning() {
+        if (liveAuthorityState != LiveAuthorityState.LIVE_COMPLETE
+                || needsScanWork()) {
+            liveAuthorityState = LiveAuthorityState.LIVE_SCANNING;
+        }
+    }
+
+    public synchronized void markLiveUnavailable() {
+        liveAuthorityState = LiveAuthorityState.NONE;
     }
 
     public synchronized int recheckColumnCount() {
@@ -207,6 +271,10 @@ public final class CaveChunkTile {
         if (safe.fullHeightComplete()) fullHeight.set(index);
         else fullHeight.clear(index);
         liveOwned.set(index);
+        if (pending.isEmpty() && recheck.isEmpty()
+                && scanned.cardinality() == COLUMN_COUNT) {
+            liveAuthorityState = LiveAuthorityState.LIVE_COMPLETE;
+        }
         if (changed) revision++;
         if (archiveChanged) archiveRevision++;
         return changed;
@@ -222,11 +290,13 @@ public final class CaveChunkTile {
             boolean changed = !pending.get(index);
             pending.set(index);
             liveOwned.set(index);
+            liveAuthorityState = LiveAuthorityState.LIVE_PENDING;
             return changed;
         }
         if (recheck.get(index)) return false;
         recheck.set(index);
         liveOwned.set(index);
+        liveAuthorityState = LiveAuthorityState.LIVE_PENDING;
         return true;
     }
 
@@ -236,6 +306,8 @@ public final class CaveChunkTile {
         pending.set(0, COLUMN_COUNT);
         recheck.clear();
         liveOwned.set(0, COLUMN_COUNT);
+        liveAuthorityState = LiveAuthorityState.LIVE_PENDING;
+        lastPublishedScannedCount = 0;
         revision++;
         archiveRevision++;
     }
@@ -248,6 +320,7 @@ public final class CaveChunkTile {
         pending.set(index);
         recheck.clear(index);
         liveOwned.set(index);
+        liveAuthorityState = LiveAuthorityState.LIVE_PENDING;
         if (changed) {
             revision++;
             archiveRevision++;
@@ -315,6 +388,8 @@ public final class CaveChunkTile {
             tile.pending.andNot(tile.scanned);
             tile.revision = Math.max(1L, snapshot.revision());
             tile.archiveRevision = tile.revision;
+            tile.publishedArchiveRevision = tile.archiveRevision;
+            tile.lastPublishedScannedCount = tile.scanned.cardinality();
             tile.savedRevision = tile.revision;
         }
         return tile;

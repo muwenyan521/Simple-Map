@@ -29,6 +29,8 @@ public final class MapViewLoadPlanner {
      */
     public static final int MINIMAP_MAX_RADIUS_PAGES = 10;
 
+    /** Cave gameplay writer: Xaero-equivalent centre +/-2 64x64 map pages. */
+    public static final int CAVE_MINIMAP_MAX_RADIUS_PAGES = 2;
     private MapViewLoadPlanner() {
     }
 

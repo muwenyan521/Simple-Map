@@ -18,6 +18,10 @@ public final class MapPerformanceGovernor {
     private static final long MAX_MUTATION_CREDIT_NANOS = 550_000L;
     private static final long MAX_MUTATION_CREDIT_GAIN_PER_FRAME_NANOS = 80_000L;
     private static final long MAX_MUTATION_BURST_PER_TICK_NANOS = 250_000L;
+    /** JVM heap pressure is part of map pressure. The latest Cave capture reached
+     * 94% of a 4 GiB heap while frame-time-only pressure was still false, allowing
+     * background producers to keep allocating until a GC pause. */
+    private static final double HEAP_PRESSURE_ENTER = 0.82D;
 
     private volatile boolean fullscreenOpen;
     private volatile boolean interacting;
@@ -27,6 +31,7 @@ public final class MapPerformanceGovernor {
     private volatile double configuredTargetFrameNanos = DEFAULT_TARGET_FRAME_NANOS;
     private volatile long lastTargetRefreshNanos;
     private volatile int pressureFrames;
+    private volatile double heapPressure;
     private volatile double focusWorldX;
     private volatile double focusWorldZ;
     /**
@@ -59,6 +64,13 @@ public final class MapPerformanceGovernor {
         if (previous == 0L) return;
         long elapsed = Math.min(250_000_000L, Math.max(1_000_000L, now - previous));
         smoothedFrameNanos = smoothedFrameNanos * 0.92 + elapsed * 0.08;
+        Runtime runtime = Runtime.getRuntime();
+        long maximumHeap = runtime.maxMemory();
+        if (maximumHeap > 0L) {
+            long usedHeap = runtime.totalMemory() - runtime.freeMemory();
+            heapPressure = Math.max(0.0D, Math.min(1.0D,
+                    usedHeap / (double) maximumHeap));
+        }
         double target = targetFrameNanos();
         if (elapsed > target * 1.75D) pressureFrames = Math.min(120, pressureFrames + 4);
         else if (elapsed > target * 1.35D) pressureFrames = Math.min(120, pressureFrames + 1);
@@ -93,6 +105,7 @@ public final class MapPerformanceGovernor {
     public boolean underPressure() {
         double target = targetFrameNanos();
         return pressureFrames > 8 || smoothedFrameNanos > target * 1.40D
+                || heapPressure >= HEAP_PRESSURE_ENTER
                 || MapWorkScheduler.cpuTotalCost() > 1_240L
                 || MapWorkScheduler.ioTotalCost() > 680L;
     }

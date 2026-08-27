@@ -34,9 +34,14 @@ public final class CaveProjectionSemanticsCheck {
                 + "simplemap/client/cave/CaveWorldSaveChunkDecoder.java"));
         String projector = Files.readString(Path.of("src/main/java/com/velorise/"
                 + "simplemap/client/cave/CaveDisplayProjector.java"));
-        require(liveScanner.contains("inOpenRun && kind == CaveStateClassifier.DYNAMIC"),
+        require(liveScanner.contains("if (cursor.inOpenRun)")
+                        && liveScanner.contains(
+                                "CaveProjectionSemantics.isOpenDecoration")
+                        && liveScanner.contains(
+                                "kind == CaveStateClassifier.DYNAMIC"),
                 "Live archive may let decoration open a false cave");
-        require(saveDecoder.contains("inOpenRun && kind == CaveStateClassifier.DYNAMIC"),
+        require(saveDecoder.contains(
+                        "inOpenRun && CaveProjectionSemantics.isOpenDecoration"),
                 "World-save archive may let decoration open a false cave");
         require(!projector.contains("FULL_CAVE_MIN_HEADROOM"),
                 "Full Cave still drops legitimate one-block openings unlike Xaero");

@@ -15,7 +15,7 @@ public final class CavePass82ViewportAuthorityCheck {
         String manager = Files.readString(
                 root.resolve("UnifiedCaveTextureManager.java"));
 
-        require(style.contains("STYLE_SIGNATURE_VERSION = 19"),
+        require(style.contains("STYLE_SIGNATURE_VERSION = 20"),
                 "stale PASS80/PASS81 Full CIMG files are not invalidated");
         require(projection.contains("void activateViewport(")
                         && projection.contains("request.pageMask = viewportMask")
@@ -30,7 +30,7 @@ public final class CavePass82ViewportAuthorityCheck {
                         && projection.contains("CAVE_FULL_ARCHIVE_AUTHORITY_WAIT"),
                 "Full projection can still publish Dense fallback as exact authority");
 
-        require(manager.contains("foregroundImportStillOwned(imported, key)")
+        require(manager.contains("foregroundImportStillOwned(imported, key, now)")
                         && manager.contains("order=viewport_scanline_sweep_top_left")
                         && manager.contains("lastPageX >= minPageX")
                         && manager.contains("lastPageZ >= minPageZ"),

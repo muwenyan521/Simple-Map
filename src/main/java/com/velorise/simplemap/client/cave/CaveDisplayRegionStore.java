@@ -26,15 +26,16 @@ import com.velorise.simplemap.client.MapConfig;
 final class CaveDisplayRegionStore {
     private static final int REGION_MAGIC = 0x43564431; // CVD1
     /*
-     * v7 invalidates dense projections derived from the old live Cave roof-entry
-     * heuristic and pre-PASS117 archive water material composition.
+     * v9 stores exact Layered Top-Y in the append record identity. The payload
+     * already retained it, but the v8 index collapsed every exact slice in one
+     * 16-block band to a single mutable slot.
      */
-    private static final int REGION_VERSION = 7;
+    private static final int REGION_VERSION = CaveCacheSchema.DISPLAY_REGION_VERSION;
     private static final int RECORD_MAGIC = 0x4454494C; // DTIL
     private static final int TILE_MAGIC = 0x44435431; // DCT1
-    private static final int TILE_VERSION = 8;
+    private static final int TILE_VERSION = CaveCacheSchema.DISPLAY_TILE_VERSION;
     private static final int HEADER_BYTES = Integer.BYTES * 2;
-    private static final int RECORD_HEADER_BYTES = Integer.BYTES * 7;
+    private static final int RECORD_HEADER_BYTES = Integer.BYTES * 8;
     private static final int MAX_PAYLOAD = 1 << 20;
     private static final Map<String, Object> LOCKS = new ConcurrentHashMap<>();
 
@@ -85,6 +86,7 @@ final class CaveDisplayRegionStore {
                         output.writeInt(tile.chunkZ());
                         output.writeInt(tile.view().ordinal());
                         output.writeInt(tile.layerY());
+                        output.writeInt(tile.projectionTopY());
                         output.writeInt(payload.length);
                         output.writeInt((int) crc.getValue());
                         long offset = output.getFilePointer();
@@ -187,6 +189,7 @@ final class CaveDisplayRegionStore {
                     int chunkZ = input.readInt();
                     int viewOrdinal = input.readInt();
                     int layerY = input.readInt();
+                    int projectionTopY = input.readInt();
                     int length = input.readInt();
                     int checksum = input.readInt();
                     if (magic != RECORD_MAGIC || length <= 0 || length > MAX_PAYLOAD
@@ -194,7 +197,8 @@ final class CaveDisplayRegionStore {
                             || viewOrdinal < 0 || viewOrdinal >= CaveView.values().length
                             || input.getFilePointer() + length > input.length()) break;
                     CaveView view = CaveView.values()[viewOrdinal];
-                    DenseCaveTileKey key = new DenseCaveTileKey(chunkX, chunkZ, view, layerY);
+                    DenseCaveTileKey key = new DenseCaveTileKey(
+                            chunkX, chunkZ, view, layerY, projectionTopY);
                     long offset = input.getFilePointer();
                     output.put(key, new RecordPointer(region[0], region[1], key,
                             offset, length, checksum));
@@ -327,7 +331,8 @@ final class CaveDisplayRegionStore {
 
     /** Persistent cave material colour depends on colour mode and visual schema. */
     private static String colourNamespacePrefix() {
-        return "c4-m" + Math.max(0, MapConfig.blockColourMode) + "-";
+        return "c" + CaveCacheSchema.EPOCH + "-m"
+                + Math.max(0, MapConfig.blockColourMode) + "-";
     }
 
     private static int[] regionCoordinates(File file) {

@@ -77,7 +77,7 @@ public final class DenseCaveTile {
         this.view = view;
         this.layerY = normalizeLayer(view, layerY);
         this.projectionTopY = view == CaveView.FULL ? Integer.MIN_VALUE : projectionTopY;
-        this.revision = Math.max(1L, revision);
+        this.revision = CaveCacheSchema.canonicalContentRevision(revision);
         this.source = source == null ? Source.DISK : source;
         this.baseColors = trustedArrays ? baseColors : Arrays.copyOf(baseColors, COLUMN_COUNT);
         this.floorY = trustedArrays ? floorY : Arrays.copyOf(floorY, COLUMN_COUNT);
@@ -334,6 +334,23 @@ public final class DenseCaveTile {
                     Arrays.copyOf(overlayLight, OVERLAY_ENTRY_COUNT),
                     Arrays.copyOf(overlayFlags, OVERLAY_ENTRY_COUNT),
                     populated, true);
+        }
+
+        /**
+         * Transfers this one-shot builder's backing arrays directly into the
+         * immutable tile. Cave projection builders are discarded immediately after
+         * publication (or nulled before a follow-up transaction), so copying eleven
+         * arrays only doubled short-lived allocation and GC pressure.
+         *
+         * <p>The builder must not be mutated after this call.</p>
+         */
+        public DenseCaveTile buildOwned(int chunkX, int chunkZ, CaveView view,
+                int layerY, int projectionTopY, long revision, Source source) {
+            return new DenseCaveTile(chunkX, chunkZ, view, layerY, projectionTopY,
+                    revision, source,
+                    baseColors, floorY, topY, flags, baseLight, overlayCounts,
+                    overlayColors, overlayAlpha, overlayY, overlayLight,
+                    overlayFlags, populated, true);
         }
     }
 

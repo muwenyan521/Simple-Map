@@ -8,6 +8,7 @@ import net.minecraft.world.level.Level;
 
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,9 +40,9 @@ final class CaveRegionProjectionService {
      * Keep fullscreen throughput high, but prevent gameplay/minimap Cave from
      * occupying all global CPU workers with eight simultaneous 24-page region jobs.
      */
-    private static final int MAX_ACTIVE_MINIMAP_REGION_BUILDS = 4;
+    private static final int MAX_ACTIVE_MINIMAP_REGION_BUILDS = 1;
     private static final int MAX_ACTIVE_BACKGROUND_REGION_BUILDS = 2;
-    private static final int MINIMAP_REGION_PAGE_SLICE = 12;
+    private static final int MINIMAP_REGION_PAGE_SLICE = 4;
     private static final int FULLSCREEN_REGION_PAGE_SLICE = 24;
     private static final int BACKGROUND_REGION_PAGE_SLICE = 8;
     private static final int MAX_PROJECTED_PAGES = 4096;
@@ -55,6 +56,15 @@ final class CaveRegionProjectionService {
     private static final long REGION_WRITE_DEBOUNCE_MS = 1_200L;
     /** A continuously changing region still receives a periodic durable checkpoint. */
     private static final long REGION_WRITE_MAX_DIRTY_MS = 5_000L;
+    /**
+     * A CIMG write always emits the full 512x512 / 1 MiB body even when only one
+     * 64x64 child is known. PASS154 wrote 253 region transactions in ~5 minutes,
+     * 85 of them with four pages or fewer. Keep sparse edge state in CAV8/CVD and
+     * only persist the packaged image after it is useful as a viewport bootstrap.
+     */
+    private static final int REGION_WRITE_MIN_PACKAGED_PAGES = 8;
+    /** Coalesce at least one eighth-region of new/revised page progress per write. */
+    private static final int REGION_WRITE_MIN_PROGRESS = 8;
     private static final int MAX_PENDING_REGION_WRITES = 1;
     /** Keep completed visible region transactions alive across repeated viewport pulses. */
     private static final long FOREGROUND_REQUEST_LEASE_MS = 2_000L;
@@ -67,6 +77,15 @@ final class CaveRegionProjectionService {
     private static final long FOREGROUND_REOFFER_MS = 250L;
     /** Small coherent frontier slice, matching Xaero's bounded region updates. */
     private static final int FOREGROUND_RELEASE_SLICE = 64;
+    /**
+     * PASS165: a retained foreground region is a live projection subscription, not
+     * a one-shot build. Source chunks can finish after a partial ProjectedPage was
+     * cached. Reconcile a bounded number of active regions every maintenance pulse
+     * so source-revision drift automatically re-arms projection without waiting for
+     * a new viewport/minimap subscription.
+     */
+    private static final int FOREGROUND_REVISION_RECONCILE_BUDGET = 32;
+    private static final long FOREGROUND_REVISION_RECONCILE_INTERVAL_MS = 24L;
 
     private final CaveTileRepository repository = CaveTileRepository.getInstance();
     private final CaveRegionImageCache regionImageCache =
@@ -93,6 +112,9 @@ final class CaveRegionProjectionService {
                             .comparingInt(ProjectedPage::priority).reversed())
                     .thenComparingLong(ProjectedPage::sequence));
     private final Set<RegionKey> pendingWrites = new HashSet<>();
+    /** Current loading-generation authority per foreground presentation lane. */
+    private final EnumMap<MapRequestLane, CavePresentationGeneration>
+            activePresentationGenerations = new EnumMap<>(MapRequestLane.class);
 
     private long epoch = 1L;
     private long sequence;
@@ -116,6 +138,7 @@ final class CaveRegionProjectionService {
         regions.clear();
         readyPages.clear();
         pendingWrites.clear();
+        activePresentationGenerations.clear();
         activeBuilds = 0;
         activeRegionBuilds = 0;
     }
@@ -143,6 +166,11 @@ final class CaveRegionProjectionService {
                         && (view == null || entry.getKey().view() != view));
         readyPages.removeIf(page -> dimension.equals(page.dimension())
                 && (view == null || page.view() != view));
+        activePresentationGenerations.entrySet().removeIf(entry -> {
+            CavePresentationGeneration generation = entry.getValue();
+            return generation == null || dimension.equals(generation.dimension())
+                    && (view == null || generation.view() != view);
+        });
         /*
          * Old-view CIMG consolidation is optional cache work. Do not let it keep
          * allocating and writing 1 MiB transactions after the user has selected a
@@ -232,12 +260,22 @@ final class CaveRegionProjectionService {
     synchronized void activateViewport(String dimension, CaveView view,
             int projectionTopY, int minPageX, int maxPageX,
             int minPageZ, int maxPageZ, int focusPageX, int focusPageZ,
-            MapRequestLane foregroundLane) {
+            MapRequestLane foregroundLane,
+            CavePresentationGeneration presentationGeneration) {
         if (dimension == null || dimension.isBlank() || view == null) return;
         MapRequestLane effectiveForegroundLane = foregroundLane == null
                 ? MapRequestLane.MINIMAP : foregroundLane;
         int canonicalTopY = canonicalTopY(view, projectionTopY);
         int normalizedLayer = DenseCaveTile.normalizeLayer(view, canonicalTopY);
+        if (presentationGeneration != null
+                && presentationGeneration.matches(dimension, view,
+                        normalizedLayer, canonicalTopY,
+                        effectiveForegroundLane)) {
+            activePresentationGenerations.put(
+                    effectiveForegroundLane, presentationGeneration);
+        } else {
+            activePresentationGenerations.remove(effectiveForegroundLane);
+        }
 
         /*
          * PASS129: foreground lane ownership is one presentation projection at a
@@ -331,6 +369,8 @@ final class CaveRegionProjectionService {
              * identity. Update it on MINIMAP <-> FULLSCREEN transitions so queued
              * region offers are relabelled instead of arriving at a dead planner. */
             request.foregroundLane = effectiveForegroundLane;
+            request.setForegroundGeneration(activePresentationGeneration(
+                    effectiveForegroundLane, key));
             request.focusPageX = focusPageX;
             request.focusPageZ = focusPageZ;
             request.priority = viewportScanlinePriority(key.regionX(), key.regionZ(),
@@ -378,6 +418,38 @@ final class CaveRegionProjectionService {
         return key != null && dimension.equals(key.dimension())
                 && key.view() == view && key.normalizedLayer() == normalizedLayer
                 && key.projectionTopY() == projectionTopY;
+    }
+
+    private CavePresentationGeneration activePresentationGeneration(
+            MapRequestLane lane, PageKey key) {
+        if (key == null) return null;
+        return activePresentationGeneration(lane, key.dimension(), key.view(),
+                key.normalizedLayer(), key.projectionTopY());
+    }
+
+    private CavePresentationGeneration activePresentationGeneration(
+            MapRequestLane lane, RegionBuildKey key) {
+        if (key == null) return null;
+        return activePresentationGeneration(lane, key.dimension(), key.view(),
+                key.normalizedLayer(), key.projectionTopY());
+    }
+
+    private CavePresentationGeneration activePresentationGeneration(
+            MapRequestLane lane, ProjectedPage page) {
+        if (page == null) return null;
+        return activePresentationGeneration(lane, page.dimension(), page.view(),
+                page.normalizedLayer(), page.projectionTopY());
+    }
+
+    private CavePresentationGeneration activePresentationGeneration(
+            MapRequestLane lane, String dimension, CaveView view,
+            int normalizedLayer, int projectionTopY) {
+        if (lane == null || lane == MapRequestLane.BACKGROUND
+                || lane == MapRequestLane.PREFETCH) return null;
+        CavePresentationGeneration generation =
+                activePresentationGenerations.get(lane);
+        return generation != null && generation.matches(dimension, view,
+                normalizedLayer, projectionTopY, lane) ? generation : null;
     }
 
     private static boolean matchesProjection(RegionKey key, String dimension,
@@ -443,13 +515,75 @@ final class CaveRegionProjectionService {
         MapRequestLane effectiveLane = lane == null
                 ? MapRequestLane.FULLSCREEN : lane;
         synchronized (this) {
-            if (regionOwnsPageLocked(key)) {
+            CavePresentationGeneration presentationGeneration =
+                    activePresentationGeneration(effectiveLane, key);
+            RegionBuildRequest regionOwner = regionRequestForPageLocked(key);
+            if (regionOwner != null) {
+                /*
+                 * PASS165: region ownership must not turn a stale partial product
+                 * into a permanent no-op. If source revision advanced after the
+                 * region cached this page, re-arm that exact bit immediately. This
+                 * is the direct visible-page escape hatch; the maintenance sweep
+                 * below provides the same repair even without another request().
+                 */
+                ProjectedPage retained = pages.get(key);
+                if (retained == null || retained.sourceRevision() != sourceRevision) {
+                    int localX = Math.floorMod(globalPageX,
+                            CaveLoadHierarchy.PAGES_PER_REGION);
+                    int localZ = Math.floorMod(globalPageZ,
+                            CaveLoadHierarchy.PAGES_PER_REGION);
+                    int ordinal = localZ * CaveLoadHierarchy.PAGES_PER_REGION
+                            + localX;
+                    long bit = 1L << ordinal;
+                    regionOwner.pageMask |= bit;
+                    regionOwner.completedMask &= ~bit;
+                    regionOwner.offeredForegroundMask &= ~bit;
+                    regionOwner.acknowledgedForegroundMask &= ~bit;
+                    regionOwner.offeredSourceRevisions[ordinal] = 0L;
+                    regionOwner.offeredLaneRanks[ordinal] = 0;
+                    regionOwner.lastOfferedMs[ordinal] = 0L;
+                    regionOwner.acknowledgedSourceRevisions[ordinal] = 0L;
+                    regionOwner.acknowledgedLaneRanks[ordinal] = 0;
+                    regionOwner.retryAfterMs = 0L;
+                    regionOwner.sequence = sequence++;
+                    if (!regionOwner.inFlight) {
+                        regionQueue.remove(regionOwner);
+                        regionQueue.offer(regionOwner);
+                    }
+                    MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                    String eventKey = "CAVE_REGION_OWNED_STALE_PAGE_REARMED:"
+                            + dimension + ':' + view + ':' + canonicalTopY + ':'
+                            + globalPageX + ':' + globalPageZ;
+                    if (recorder.shouldEmitEvent(eventKey, 250L)) {
+                        recorder.event("CAVE_REGION_OWNED_STALE_PAGE_REARMED",
+                                "page=" + globalPageX + ',' + globalPageZ
+                                        + " view=" + view
+                                        + " top_y=" + canonicalTopY
+                                        + " cached_revision="
+                                        + (retained == null ? 0L
+                                                : retained.sourceRevision())
+                                        + " current_revision=" + sourceRevision
+                                        + " action=rearm_region_projection"
+                                        + " pass=PASS165");
+                    }
+                } else {
+                    promoteCachedRegionPagesLocked(regionOwner, 1L
+                            << (Math.floorMod(globalPageZ,
+                                    CaveLoadHierarchy.PAGES_PER_REGION)
+                            * CaveLoadHierarchy.PAGES_PER_REGION
+                            + Math.floorMod(globalPageX,
+                                    CaveLoadHierarchy.PAGES_PER_REGION)),
+                            effectiveLane);
+                    releaseForegroundBatchLocked(regionOwner);
+                }
                 pumpLocked();
                 return;
             }
             ProjectedPage cached = pages.get(key);
             if (cached != null && cached.sourceRevision() == sourceRevision) {
-                readyPages.offer(cached.asDirectOffer(effectiveLane));
+                recordProjectionProductReuse(key, effectiveLane, true);
+                readyPages.offer(cached.asDirectOffer(
+                        effectiveLane, presentationGeneration));
                 return;
             }
             Request existing = requests.get(key);
@@ -469,12 +603,16 @@ final class CaveRegionProjectionService {
                         ? priority : Math.max(existing.priority, priority);
                 existing.sequence = sequence++;
                 existing.retryAfterMs = 0L;
+                existing.addSubscriber(effectiveLane, presentationGeneration);
+                recordProjectionProductReuse(key, effectiveLane, true);
                 if (!existing.inFlight) queue.offer(existing);
                 pumpLocked();
                 return;
             }
             Request request = new Request(key, level, sourceRevision,
-                    repositoryGeneration, effectiveLane, priority, sequence++);
+                    repositoryGeneration, effectiveLane, priority, sequence++,
+                    presentationGeneration);
+            recordProjectionProductBuildStarted(key, effectiveLane);
             requests.put(key, request);
             queue.offer(request);
             pumpLocked();
@@ -504,6 +642,46 @@ final class CaveRegionProjectionService {
                 ? MapRequestLane.FULLSCREEN : lane;
         synchronized (this) {
             long now = System.currentTimeMillis();
+            /*
+             * PASS169: a source completion from the previous Cave Top-Y can arrive
+             * after the fullscreen presentation generation has already moved on.
+             * PASS167/168 allowed that late completion to recreate a foreground
+             * RegionBuildRequest with a null/old generation, so the producer spent
+             * seconds re-offering immutable pages that the texture manager correctly
+             * rejected as superseded. The 18:09 trace shows exactly this: after
+             * switching -8 -> 17, the old -8 projection emitted 300+ foreground
+             * waves and 134 rejected handoffs while the new layer barely progressed.
+             *
+             * A foreground exact projection is useful only for the active lane
+             * generation. Raw/CAV8 source remains retained independently, so drop
+             * stale exact projection requests at the producer boundary instead of
+             * constructing work that has no consumer.
+             */
+            if (effectiveLane == MapRequestLane.MINIMAP
+                    || effectiveLane == MapRequestLane.FULLSCREEN) {
+                CavePresentationGeneration active =
+                        activePresentationGenerations.get(effectiveLane);
+                if (active != null && !active.matches(dimension, view,
+                        normalizedLayer, canonicalTopY, effectiveLane)) {
+                    MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                    String staleKey = "CAVE_SUPERSEDED_FOREGROUND_REGION_REQUEST_DROPPED:"
+                            + effectiveLane + ':' + dimension + ':' + view + ':'
+                            + canonicalTopY + ':' + regionX + ':' + regionZ;
+                    if (recorder.shouldEmitEvent(staleKey, 500L)) {
+                        recorder.event(
+                                "CAVE_SUPERSEDED_FOREGROUND_REGION_REQUEST_DROPPED",
+                                "region=" + regionX + ',' + regionZ
+                                        + " view=" + view
+                                        + " top_y=" + canonicalTopY
+                                        + " lane=" + effectiveLane
+                                        + " active_top_y=" + active.projectionTopY()
+                                        + " action=drop_exact_projection_keep_source_cache"
+                                        + " policy=single_active_foreground_generation"
+                                        + " pass=PASS169");
+                    }
+                    return;
+                }
+            }
             RegionBuildRequest request = regionRequests.get(key);
             if (request == null) {
                 request = new RegionBuildRequest(key, level, repositoryGeneration,
@@ -514,12 +692,26 @@ final class CaveRegionProjectionService {
             }
             boolean foregroundRequest = effectiveLane == MapRequestLane.MINIMAP
                     || effectiveLane == MapRequestLane.FULLSCREEN;
+            boolean retainedFullscreenPresentation =
+                    effectiveLane == MapRequestLane.FULLSCREEN;
             /*
-             * Separate the current viewport lease from the pages whose source stamp
-             * actually changed. This is the same child-version model used by Xaero:
-             * stable siblings stay complete while newly ready children are appended.
+             * PASS162: FULLSCREEN source windows are bounded, but presentation is
+             * viewport-lived. PASS161 replaced pageMask/foregroundMask with every
+             * newly ready 32-page writer slice. That silently revoked CPU/GPU
+             * ownership from earlier source-settled pages before the strict scanline
+             * reached them. The result was deterministic: a few top rows appeared,
+             * then frontier=65/209 with source_resolved=16 and no runnable owner.
+             *
+             * Xaero's writer cursor moves independently from its loaded/loading map
+             * product. Mirror that split: FULLSCREEN accumulates projection leases
+             * inside the active viewport; activateViewport() remains the authority
+             * that clips them when the actual viewport/projection changes. MINIMAP
+             * keeps replacement semantics so its 5x5 working set stays bounded.
              */
-            if (foregroundRequest) {
+            if (retainedFullscreenPresentation) {
+                request.presentationRetired = false;
+                request.pageMask |= workMask;
+            } else if (foregroundRequest) {
                 request.presentationRetired = false;
                 request.pageMask = (request.pageMask & foregroundMask) | workMask;
             } else {
@@ -527,10 +719,15 @@ final class CaveRegionProjectionService {
             }
             request.lastRequestedMs = now;
             if (foregroundRequest) {
-                long removedForegroundMask = request.foregroundMask
-                        & ~foregroundMask;
-                request.setForegroundMask(foregroundMask);
-                if (removedForegroundMask != 0L) {
+                long previousForegroundMask = request.foregroundMask;
+                long targetForegroundMask = retainedFullscreenPresentation
+                        ? previousForegroundMask | foregroundMask
+                        : foregroundMask;
+                long removedForegroundMask = previousForegroundMask
+                        & ~targetForegroundMask;
+                request.setForegroundMask(targetForegroundMask);
+                if (!retainedFullscreenPresentation
+                        && removedForegroundMask != 0L) {
                     int pruned = pruneReadyForegroundLocked(
                             request.key, removedForegroundMask);
                     if (pruned > 0) {
@@ -547,6 +744,24 @@ final class CaveRegionProjectionService {
                         }
                     }
                 }
+                if (retainedFullscreenPresentation
+                        && targetForegroundMask != foregroundMask) {
+                    MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                    String eventKey = "CAVE_FULLSCREEN_PRESENTATION_MASK_RETAINED:"
+                            + request.key;
+                    if (recorder.shouldEmitEvent(eventKey, 500L)) {
+                        recorder.event("CAVE_FULLSCREEN_PRESENTATION_MASK_RETAINED",
+                                "region=" + regionX + ',' + regionZ
+                                        + " view=" + view
+                                        + " top_y=" + canonicalTopY
+                                        + " retained_pages="
+                                        + Long.bitCount(targetForegroundMask)
+                                        + " incoming_pages="
+                                        + Long.bitCount(foregroundMask)
+                                        + " policy=viewport_lifetime_not_source_window"
+                                        + " pass=PASS162");
+                    }
+                }
                 /*
                  * Foreground handoff ownership follows the current native-import
                  * lease, not the historically strongest lane. Keeping MINIMAP here
@@ -556,8 +771,10 @@ final class CaveRegionProjectionService {
                  * its stronger lane independently below.
                  */
                 request.foregroundLane = effectiveLane;
+                request.setForegroundGeneration(activePresentationGeneration(
+                        effectiveLane, key));
                 promoteCachedRegionPagesLocked(
-                        request, foregroundMask, effectiveLane);
+                        request, targetForegroundMask, effectiveLane);
             }
             request.focusPageX = focusPageX;
             request.focusPageZ = focusPageZ;
@@ -638,7 +855,10 @@ final class CaveRegionProjectionService {
              */
             if (!page.regionOffer()) {
                 if (stalePruned > 0) recordReadyQueuePrune(stalePruned);
-                return page;
+                ProjectedPage offered = page.withPresentationGeneration(
+                        activePresentationGeneration(page.lane(), page));
+                recordHandoffOffer(offered);
+                return offered;
             }
 
             RegionBuildKey regionKey = new RegionBuildKey(page.dimension(),
@@ -670,8 +890,16 @@ final class CaveRegionProjectionService {
             // consumer to reject a valid retained page.
             MapRequestLane currentLane = request.foregroundLane == null
                     ? page.lane() : request.foregroundLane;
+            CavePresentationGeneration currentGeneration =
+                    activePresentationGeneration(currentLane, page);
+            if (currentGeneration != null) {
+                request.setForegroundGeneration(currentGeneration);
+            }
             if (stalePruned > 0) recordReadyQueuePrune(stalePruned);
-            return page.lane() == currentLane ? page : page.asRegionOffer(currentLane);
+            ProjectedPage offered = page.asRegionOffer(
+                    currentLane, currentGeneration);
+            recordHandoffOffer(offered);
+            return offered;
         }
         if (stalePruned > 0) recordReadyQueuePrune(stalePruned);
         return null;
@@ -684,6 +912,13 @@ final class CaveRegionProjectionService {
             recorder.event("CAVE_REGION_FOREGROUND_QUEUE_STALE_PRUNED",
                     "pages=" + count + " policy=producer_writer_window");
         }
+    }
+
+    private static void recordHandoffOffer(ProjectedPage page) {
+        if (page == null || page.lane() == MapRequestLane.BACKGROUND
+                || page.lane() == MapRequestLane.PREFETCH) return;
+        com.velorise.simplemap.client.MapPipelineTelemetry.getInstance()
+                .recordCaveHandoffOffered();
     }
 
     /**
@@ -706,6 +941,11 @@ final class CaveRegionProjectionService {
                         CaveLoadHierarchy.PAGES_PER_REGION));
         RegionBuildRequest request = regionRequests.get(regionKey);
         if (request == null) return;
+        /* Pixel/source identity is independent from the presentation subscriber.
+         * A page polled by generation N may enter retained staging after generation
+         * N+1 attaches to the same content product. Exact source and writer-window
+         * checks below are the authority fence; the old ticket must not waste the
+         * completed product. */
         int localX = Math.floorMod(page.globalPageX(),
                 CaveLoadHierarchy.PAGES_PER_REGION);
         int localZ = Math.floorMod(page.globalPageZ(),
@@ -747,6 +987,11 @@ final class CaveRegionProjectionService {
                         CaveLoadHierarchy.PAGES_PER_REGION));
         RegionBuildRequest request = regionRequests.get(regionKey);
         if (request == null) return;
+        /* A delayed rejection from a superseded loading generation must never
+         * revoke the current generation's foreground bit for the same page. */
+        if (page.presentationGeneration() != null
+                && !page.presentationGeneration().equals(
+                        request.foregroundGeneration)) return;
         int localX = Math.floorMod(page.globalPageX(),
                 CaveLoadHierarchy.PAGES_PER_REGION);
         int localZ = Math.floorMod(page.globalPageZ(),
@@ -845,6 +1090,39 @@ final class CaveRegionProjectionService {
         return false;
     }
 
+
+    /**
+     * Pure liveness probe for the fullscreen reveal watchdog. This deliberately
+     * reports runnable projection work, not retained ownership: a completed stale
+     * region bit used to return "owned" forever even though no CPU task could ever
+     * advance it.
+     */
+    synchronized boolean hasPendingProjectionWork(CaveView view,
+            int projectionTopY, int globalPageX, int globalPageZ,
+            String dimension) {
+        if (view == null || dimension == null || dimension.isBlank()) return false;
+        int canonicalTopY = canonicalTopY(view, projectionTopY);
+        int normalizedLayer = DenseCaveTile.normalizeLayer(view, canonicalTopY);
+        PageKey key = new PageKey(dimension, view, normalizedLayer,
+                canonicalTopY, globalPageX, globalPageZ,
+                CaveProjectionStyle.signature());
+        Request direct = requests.get(key);
+        if (direct != null) return true;
+        RegionBuildKey regionKey = new RegionBuildKey(dimension, view,
+                normalizedLayer, canonicalTopY, CaveProjectionStyle.signature(),
+                Math.floorDiv(globalPageX, CaveLoadHierarchy.PAGES_PER_REGION),
+                Math.floorDiv(globalPageZ, CaveLoadHierarchy.PAGES_PER_REGION));
+        RegionBuildRequest region = regionRequests.get(regionKey);
+        if (region == null || region.presentationRetired) return false;
+        int localX = Math.floorMod(globalPageX,
+                CaveLoadHierarchy.PAGES_PER_REGION);
+        int localZ = Math.floorMod(globalPageZ,
+                CaveLoadHierarchy.PAGES_PER_REGION);
+        long bit = 1L << (localZ * CaveLoadHierarchy.PAGES_PER_REGION + localX);
+        return (region.pendingMask() & bit) != 0L
+                || region.inFlight && (region.pageMask & bit) != 0L;
+    }
+
     synchronized ProjectedPage find(CaveView view, int projectionTopY,
             int globalPageX, int globalPageZ, String dimension) {
         int canonicalTopY = canonicalTopY(view, projectionTopY);
@@ -860,10 +1138,66 @@ final class CaveRegionProjectionService {
 
     synchronized void maintain() {
         long now = System.currentTimeMillis();
+        /*
+         * PASS165: source and projection have independent completion times. A
+         * partial page can be valid at revision N, then become stale when the last
+         * source child commits revision N+1 after the writer window has moved on.
+         * Previously completedMask stayed set forever, leaving no runnable CPU work
+         * while the fullscreen frontier waited on that stale page. Minimap appeared
+         * to "fix" it only because opening/closing a subscriber called
+         * reconcileSatisfiedPages() again. Keep the active foreground product
+         * self-progressing instead.
+         */
+        reconcileForegroundRevisionDriftLocked(now);
         pruneCompletedRegionRequestsLocked(now);
         pumpLocked();
         scheduleRegionWriteLocked(now);
         trimLocked();
+    }
+
+    private void reconcileForegroundRevisionDriftLocked(long now) {
+        int inspected = 0;
+        int invalidatedPages = 0;
+        for (RegionBuildRequest request : regionRequests.values()) {
+            if (inspected >= FOREGROUND_REVISION_RECONCILE_BUDGET) break;
+            if (request == null || request.presentationRetired
+                    || request.foregroundMask == 0L
+                    || now - request.lastRevisionReconcileMs
+                            < FOREGROUND_REVISION_RECONCILE_INTERVAL_MS) {
+                continue;
+            }
+            request.lastRevisionReconcileMs = now;
+            inspected++;
+
+            long completedBefore = request.completedMask;
+            request.reconcileSatisfiedPages(repository, pages);
+            long invalidated = completedBefore & ~request.completedMask
+                    & request.foregroundMask;
+            if (invalidated != 0L) {
+                invalidatedPages += Long.bitCount(invalidated);
+                request.pageMask |= invalidated;
+                request.retryAfterMs = 0L;
+                request.sequence = sequence++;
+                if (!request.inFlight) {
+                    regionQueue.remove(request);
+                    regionQueue.offer(request);
+                }
+            }
+            /* Valid retained pages may have been waiting only for a subscriber
+             * handoff. Re-offer them from the same product without rebuilding. */
+            releaseForegroundBatchLocked(request);
+        }
+        if (invalidatedPages > 0) {
+            MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+            if (recorder.shouldEmitEvent(
+                    "CAVE_FOREGROUND_PROJECTION_REVISION_REARMED", 100L)) {
+                recorder.event("CAVE_FOREGROUND_PROJECTION_REVISION_REARMED",
+                        "pages=" + invalidatedPages
+                                + " action=reproject_current_source_revision"
+                                + " policy=foreground_product_self_progresses"
+                                + " pass=PASS165");
+            }
+        }
     }
 
     synchronized DebugSnapshot debugSnapshot() {
@@ -928,19 +1262,13 @@ final class CaveRegionProjectionService {
             long expectedSourceRevision, MapRequestLane lane, int pagePriority,
             long pageSequence, boolean regionOffer) {
         /*
-         * A 64x64 page is four-by-four Minecraft chunks. Xaero does not make one
-         * loaded MapTile depend on the other fifteen children being present; missing
-         * children simply stay transparent while the loaded children update buffers.
-         * Resolve when at least one source child is resident, then publish only whole
-         * 16x16 children below. This keeps partial pages coherent without restoring
-         * the old worker-completion "confetti" behaviour.
+         * PASS142: a 64x64 page is the GPU packing unit, not the minimum CPU/source
+         * publication unit. The repository masks incomplete data to whole 16x16
+         * Minecraft children via coherentChunkRows(), and the texture manager stages
+         * those children into a retained page. Requiring 16/16 here turned every slow
+         * source child into a black 64x64 island and made PASS141's direct exact
+         * projection path ineffective in the default native importer.
          */
-        if (!repository.hasAnyProjectionSourcePage(
-                key.view(), key.projectionTopY(),
-                key.globalPageX(), key.globalPageZ())) {
-            return null;
-        }
-
         /*
          * The archive is populated chunk-by-chunk. Bind the projection to the
          * newest coherent page snapshot, not to the fingerprint observed when the
@@ -997,7 +1325,8 @@ final class CaveRegionProjectionService {
                     key.normalizedLayer(), key.projectionTopY(),
                     key.globalPageX(), key.globalPageZ(), sourceAfterStyle,
                     styled, knownRows, knownColumns, complete,
-                    lane, pagePriority, pageSequence, regionOffer);
+                    resolved.emptyProof(),
+                    lane, pagePriority, pageSequence, regionOffer, null);
         }
         MapDebugRecorder recorder = MapDebugRecorder.getInstance();
         String eventKey = "CAVE_PAGE_SOURCE_COALESCE_RETRY:"
@@ -1171,14 +1500,19 @@ final class CaveRegionProjectionService {
         synchronized (this) {
             activeRegionBuilds = Math.max(0, activeRegionBuilds - 1);
             request.inFlight = false;
-            if (submittedEpoch != epoch
-                    || regionRequests.get(request.key) != request) {
+            if (submittedEpoch != epoch) {
                 pumpLocked();
                 return;
             }
             if (failure != null || !repository.isGenerationCurrent(
                     request.repositoryGeneration)) {
                 regionRequests.remove(request.key, request);
+                pumpLocked();
+                return;
+            }
+            if (regionRequests.get(request.key) != request) {
+                retainCompletedProductsLocked(slice);
+                trimLocked();
                 pumpLocked();
                 return;
             }
@@ -1262,7 +1596,7 @@ final class CaveRegionProjectionService {
         synchronized (this) {
             activeBuilds = Math.max(0, activeBuilds - 1);
             request.inFlight = false;
-            if (submittedEpoch != epoch || requests.get(request.key) != request) {
+            if (submittedEpoch != epoch) {
                 pumpLocked();
                 return;
             }
@@ -1270,6 +1604,12 @@ final class CaveRegionProjectionService {
                     || !repository.isGenerationCurrent(
                             request.repositoryGeneration)) {
                 requests.remove(request.key, request);
+                pumpLocked();
+                return;
+            }
+            if (requests.get(request.key) != request) {
+                retainCompletedProductLocked(request.key, page);
+                trimLocked();
                 pumpLocked();
                 return;
             }
@@ -1292,7 +1632,20 @@ final class CaveRegionProjectionService {
             }
             requests.remove(request.key, request);
             pages.put(request.key, page);
-            readyPages.offer(page);
+            boolean offered = false;
+            for (Map.Entry<MapRequestLane, CavePresentationGeneration> subscriber
+                    : request.subscribers.entrySet()) {
+                MapRequestLane subscriberLane = subscriber.getKey();
+                CavePresentationGeneration currentGeneration =
+                        activePresentationGeneration(subscriberLane, request.key);
+                readyPages.offer(page.asDirectOffer(subscriberLane,
+                        currentGeneration == null
+                                ? subscriber.getValue() : currentGeneration));
+                offered = true;
+            }
+            if (!offered && request.backgroundConsumer) {
+                readyPages.offer(page.asDirectOffer(request.lane, null));
+            }
             if (page.complete()) stageRegionLocked(page);
             MapDebugRecorder recorder = MapDebugRecorder.getInstance();
             if (recorder.shouldEmitEvent(
@@ -1316,6 +1669,62 @@ final class CaveRegionProjectionService {
                 && repository.getPageRevision(
                         request.key.view(), request.key.projectionTopY(),
                         request.key.globalPageX(), request.key.globalPageZ()) != 0L;
+    }
+
+    /** Retains valid content completed after every presentation subscriber left. */
+    private void retainCompletedProductLocked(PageKey key, ProjectedPage page) {
+        if (key == null || page == null) return;
+        long current = repository.getPageRevision(key.view(), key.projectionTopY(),
+                key.globalPageX(), key.globalPageZ());
+        if (current == 0L || current != page.sourceRevision()) return;
+        pages.put(key, page.withPresentationGeneration(null));
+        recordProjectionProductReadyWithoutSubscriber(key);
+    }
+
+    private void retainCompletedProductsLocked(RegionBuildSlice slice) {
+        if (slice == null || slice.pages() == null) return;
+        for (ProjectedPage page : slice.pages()) {
+            if (page == null) continue;
+            PageKey key = new PageKey(page.dimension(), page.view(),
+                    page.normalizedLayer(), page.projectionTopY(),
+                    page.globalPageX(), page.globalPageZ(),
+                    CaveProjectionStyle.signature());
+            retainCompletedProductLocked(key, page);
+        }
+    }
+
+    private static void recordProjectionProductBuildStarted(PageKey key,
+            MapRequestLane lane) {
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent("CAVE_PROJECTION_PRODUCT_BUILD_STARTED", 250L)) {
+            recorder.event("CAVE_PROJECTION_PRODUCT_BUILD_STARTED",
+                    "page=" + key.globalPageX() + ',' + key.globalPageZ()
+                            + " view=" + key.view() + " top_y="
+                            + key.projectionTopY() + " lane=" + lane);
+        }
+    }
+
+    private static void recordProjectionProductReuse(PageKey key,
+            MapRequestLane lane, boolean subscriberAttached) {
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent("CAVE_PROJECTION_PRODUCT_REUSED", 250L)) {
+            recorder.event("CAVE_PROJECTION_PRODUCT_REUSED",
+                    "page=" + key.globalPageX() + ',' + key.globalPageZ()
+                            + " view=" + key.view() + " top_y="
+                            + key.projectionTopY() + " lane=" + lane
+                            + " subscriber_attached=" + subscriberAttached);
+        }
+    }
+
+    private static void recordProjectionProductReadyWithoutSubscriber(PageKey key) {
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent(
+                "CAVE_PROJECTION_PRODUCT_READY_NO_CURRENT_SUBSCRIBER", 250L)) {
+            recorder.event("CAVE_PROJECTION_PRODUCT_READY_NO_CURRENT_SUBSCRIBER",
+                    "page=" + key.globalPageX() + ',' + key.globalPageZ()
+                            + " view=" + key.view() + " top_y="
+                            + key.projectionTopY() + " action=retain_content");
+        }
     }
 
     private void stageRegionLocked(ProjectedPage page) {
@@ -1343,12 +1752,25 @@ final class CaveRegionProjectionService {
             boolean writeIntervalElapsed = candidate.lastWriteAttemptMs == 0L
                     || now - candidate.lastWriteAttemptMs
                             >= REGION_WRITE_DEBOUNCE_MS;
+            int packagedPages = Long.bitCount(candidate.pageMask);
+            int newPages = Long.bitCount(candidate.pageMask
+                    & ~candidate.lastWrittenPageMask);
+            long revisedPages = Math.max(0L,
+                    candidate.version - candidate.lastWrittenVersion);
+            boolean usefulPackage = packagedPages
+                    >= REGION_WRITE_MIN_PACKAGED_PAGES;
+            boolean substantialProgress = newPages >= REGION_WRITE_MIN_PROGRESS
+                    || revisedPages >= REGION_WRITE_MIN_PROGRESS
+                    || candidate.lastWrittenVersion == 0L;
             /*
-             * A complete 64-page region is not a reason to bypass debounce. PASS81
-             * did exactly that, writing the same 1 MiB CIMG every few hundred ms
-             * while source revisions were still settling.
+             * A complete 64-page region is not a reason to bypass debounce. More
+             * importantly, do not write a full 1 MiB CIMG for one or two children.
+             * CAV8/CVD are the sparse durable products; CIMG is the packaged visual
+             * bootstrap and should be written in meaningful coherent checkpoints.
              */
-            if ((!quiet && !maxDirtyAge) || !writeIntervalElapsed) continue;
+            if (!usefulPackage || (!quiet && !maxDirtyAge)
+                    || !writeIntervalElapsed
+                    || (!substantialProgress && !maxDirtyAge)) continue;
             selected = candidate;
             break;
         }
@@ -1358,6 +1780,10 @@ final class CaveRegionProjectionService {
         long submittedEpoch = epoch;
         CaveRegionImageCache.RegionImage snapshot = target.snapshot(now);
         if (snapshot == null || !pendingWrites.add(target.key)) return;
+        long snapshotPageMask = snapshot.pageMask();
+        int snapshotPages = Long.bitCount(snapshotPageMask);
+        int snapshotNewPages = Long.bitCount(snapshotPageMask
+                & ~target.lastWrittenPageMask);
         target.lastWriteAttemptMs = now;
         CompletableFuture<Boolean> future = MapWorkScheduler.tryIoFuture(
                 MapRequestLane.BACKGROUND, MapWorkScheduler.WorkType.DISK_WRITE,
@@ -1374,10 +1800,14 @@ final class CaveRegionProjectionService {
                 if (submittedEpoch != epoch) return;
                 RegionTransaction current = regions.get(target.key);
                 if (current != null && failure == null
-                        && Boolean.TRUE.equals(saved)
-                        && current.version == writeVersion) {
-                    current.dirty = false;
-                    current.dirtySinceMs = 0L;
+                        && Boolean.TRUE.equals(saved)) {
+                    current.lastWrittenPageMask = snapshotPageMask;
+                    current.lastWrittenVersion = Math.max(
+                            current.lastWrittenVersion, writeVersion);
+                    if (current.version == writeVersion) {
+                        current.dirty = false;
+                        current.dirtySinceMs = 0L;
+                    }
                     MapDebugRecorder recorder = MapDebugRecorder.getInstance();
                     if (recorder.shouldEmitEvent(
                             "CAVE_REGION_TRANSACTION_SAVED:" + target.key, 250L)) {
@@ -1386,8 +1816,10 @@ final class CaveRegionProjectionService {
                                         + target.key.regionZ()
                                         + " view=" + target.key.view()
                                         + " top_y=" + target.key.projectionTopY()
-                                        + " pages=" + Long.bitCount(
-                                                target.pageMask));
+                                        + " pages=" + snapshotPages
+                                        + " new_pages=" + snapshotNewPages
+                                        + " policy=coalesced_packaged_cimg"
+                                        + " pass=PASS155");
                     }
                 }
                 scheduleRegionWriteLocked(System.currentTimeMillis());
@@ -1398,6 +1830,49 @@ final class CaveRegionProjectionService {
 
     private void releaseForegroundBatchLocked(RegionBuildRequest request) {
         if (request == null || request.foregroundMask == 0L) return;
+
+        /*
+         * PASS169: foreground offers are a subscription to the currently visible
+         * generation, not a durable property of a cached region product. In-flight
+         * slices from a retired layer may finish, but they must never re-arm/re-offer
+         * themselves after activateViewport() switched Top-Y. Fence publication at
+         * the producer as well as at the consumer so stale work cannot create a
+         * reject/re-offer loop.
+         */
+        if (request.foregroundLane == MapRequestLane.MINIMAP
+                || request.foregroundLane == MapRequestLane.FULLSCREEN) {
+            CavePresentationGeneration active =
+                    activePresentationGenerations.get(request.foregroundLane);
+            boolean projectionMismatch = active != null
+                    && !active.matches(request.key.dimension(), request.key.view(),
+                            request.key.normalizedLayer(),
+                            request.key.projectionTopY(), request.foregroundLane);
+            if (request.presentationRetired || projectionMismatch) {
+                int stalePages = Long.bitCount(request.foregroundMask);
+                request.setForegroundMask(0L);
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                String staleKey = "CAVE_STALE_FOREGROUND_REOFFER_SUPPRESSED:"
+                        + request.key + ':' + request.foregroundLane;
+                if (stalePages > 0 && recorder.shouldEmitEvent(staleKey, 500L)) {
+                    recorder.event("CAVE_STALE_FOREGROUND_REOFFER_SUPPRESSED",
+                            "region=" + request.key.regionX() + ','
+                                    + request.key.regionZ()
+                                    + " view=" + request.key.view()
+                                    + " top_y=" + request.key.projectionTopY()
+                                    + " lane=" + request.foregroundLane
+                                    + " pages=" + stalePages
+                                    + " action=retire_offer_without_touching_retained_pixels"
+                                    + " policy=single_active_foreground_generation"
+                                    + " pass=PASS169");
+                }
+                return;
+            }
+            if (active != null
+                    && !java.util.Objects.equals(
+                            request.foregroundGeneration, active)) {
+                request.setForegroundGeneration(active);
+            }
+        }
 
         java.util.List<Integer> ordinals =
                 request.orderedOrdinals(request.foregroundMask);
@@ -1434,7 +1909,8 @@ final class CaveRegionProjectionService {
                             >= requestedRank
                     && now - request.lastOfferedMs[ordinal] < FOREGROUND_REOFFER_MS;
             if (recentlyOffered) continue;
-            batch.add(page.asRegionOffer(request.foregroundLane));
+            batch.add(page.asRegionOffer(
+                    request.foregroundLane, request.foregroundGeneration));
             offeredOrdinals.add(ordinal);
             if (batch.size() >= FOREGROUND_RELEASE_SLICE) break;
         }
@@ -1514,7 +1990,7 @@ final class CaveRegionProjectionService {
         }
     }
 
-    private boolean regionOwnsPageLocked(PageKey pageKey) {
+    private RegionBuildRequest regionRequestForPageLocked(PageKey pageKey) {
         RegionBuildKey regionKey = new RegionBuildKey(pageKey.dimension(),
                 pageKey.view(), pageKey.normalizedLayer(),
                 pageKey.projectionTopY(), pageKey.styleSignature(),
@@ -1524,7 +2000,12 @@ final class CaveRegionProjectionService {
                         CaveLoadHierarchy.PAGES_PER_REGION));
         RegionBuildRequest request = regionRequests.get(regionKey);
         return request != null
-                && request.owns(pageKey.globalPageX(), pageKey.globalPageZ());
+                && request.owns(pageKey.globalPageX(), pageKey.globalPageZ())
+                        ? request : null;
+    }
+
+    private boolean regionOwnsPageLocked(PageKey pageKey) {
+        return regionRequestForPageLocked(pageKey) != null;
     }
 
     private static int canonicalTopY(CaveView view, int projectionTopY) {
@@ -1561,8 +2042,10 @@ final class CaveRegionProjectionService {
     record ProjectedPage(String dimension, CaveView view, int normalizedLayer,
             int projectionTopY, int globalPageX, int globalPageZ,
             long sourceRevision, int[] pixels, long[] knownRows,
-            int knownColumnCount, boolean complete, MapRequestLane lane,
-            int priority, long sequence, boolean regionOffer) {
+            int knownColumnCount, boolean complete, CaveEmptyProof emptyProof,
+            MapRequestLane lane,
+            int priority, long sequence, boolean regionOffer,
+            CavePresentationGeneration presentationGeneration) {
         ProjectedPage {
             /*
              * buildPage() hands ownership of freshly allocated styled/known arrays
@@ -1574,6 +2057,7 @@ final class CaveRegionProjectionService {
              * cloning the tile for every priority transition.
              */
             lane = lane == null ? MapRequestLane.FULLSCREEN : lane;
+            emptyProof = emptyProof == null ? CaveEmptyProof.NONE : emptyProof;
         }
 
         @Override
@@ -1601,25 +2085,46 @@ final class CaveRegionProjectionService {
             return new ProjectedPage(dimension, view, normalizedLayer,
                     projectionTopY, globalPageX, globalPageZ, sourceRevision,
                     pixels, knownRows, knownColumnCount, complete,
-                    replacement, priority, sequence, regionOffer);
+                    emptyProof,
+                    replacement, priority, sequence, regionOffer,
+                    presentationGeneration);
         }
 
-        ProjectedPage asDirectOffer(MapRequestLane replacement) {
-            MapRequestLane effective = replacement == null ? lane : replacement;
-            if (!regionOffer && effective == lane) return this;
+        ProjectedPage withPresentationGeneration(
+                CavePresentationGeneration replacement) {
+            if (java.util.Objects.equals(
+                    presentationGeneration, replacement)) return this;
             return new ProjectedPage(dimension, view, normalizedLayer,
                     projectionTopY, globalPageX, globalPageZ, sourceRevision,
                     pixels, knownRows, knownColumnCount, complete,
-                    effective, priority, sequence, false);
+                    emptyProof,
+                    lane, priority, sequence, regionOffer, replacement);
         }
 
-        ProjectedPage asRegionOffer(MapRequestLane replacement) {
+        ProjectedPage asDirectOffer(MapRequestLane replacement,
+                CavePresentationGeneration generation) {
             MapRequestLane effective = replacement == null ? lane : replacement;
-            if (regionOffer && effective == lane) return this;
+            if (!regionOffer && effective == lane
+                    && java.util.Objects.equals(
+                            presentationGeneration, generation)) return this;
             return new ProjectedPage(dimension, view, normalizedLayer,
                     projectionTopY, globalPageX, globalPageZ, sourceRevision,
                     pixels, knownRows, knownColumnCount, complete,
-                    effective, priority, sequence, true);
+                    emptyProof,
+                    effective, priority, sequence, false, generation);
+        }
+
+        ProjectedPage asRegionOffer(MapRequestLane replacement,
+                CavePresentationGeneration generation) {
+            MapRequestLane effective = replacement == null ? lane : replacement;
+            if (regionOffer && effective == lane
+                    && java.util.Objects.equals(
+                            presentationGeneration, generation)) return this;
+            return new ProjectedPage(dimension, view, normalizedLayer,
+                    projectionTopY, globalPageX, globalPageZ, sourceRevision,
+                    pixels, knownRows, knownColumnCount, complete,
+                    emptyProof,
+                    effective, priority, sequence, true, generation);
         }
     }
 
@@ -1670,11 +2175,15 @@ final class CaveRegionProjectionService {
         private final long[] acknowledgedSourceRevisions = new long[64];
         private final byte[] acknowledgedLaneRanks = new byte[64];
         private MapRequestLane foregroundLane = MapRequestLane.FULLSCREEN;
+        /** Stable loading generation; independent from the short foreground mask. */
+        private CavePresentationGeneration foregroundGeneration;
         private int focusPageX;
         private int focusPageZ;
         private long retryAfterMs;
         private long lastRequestedMs;
         private boolean inFlight;
+        /** Last bounded source-revision reconciliation for this retained product. */
+        private long lastRevisionReconcileMs;
         /** Foreground projection was replaced while this region slice was running. */
         private boolean presentationRetired;
 
@@ -1768,6 +2277,21 @@ final class CaveRegionProjectionService {
             acknowledgedForegroundMask &= mask;
         }
 
+        private void setForegroundGeneration(
+                CavePresentationGeneration generation) {
+            if (java.util.Objects.equals(foregroundGeneration, generation)) return;
+            foregroundGeneration = generation;
+            /* ACKs belong to one loading transaction, even when immutable pixels
+             * and region/page identity are reused by the next generation. */
+            offeredForegroundMask = 0L;
+            acknowledgedForegroundMask = 0L;
+            java.util.Arrays.fill(offeredSourceRevisions, 0L);
+            java.util.Arrays.fill(offeredLaneRanks, (byte) 0);
+            java.util.Arrays.fill(lastOfferedMs, 0L);
+            java.util.Arrays.fill(acknowledgedSourceRevisions, 0L);
+            java.util.Arrays.fill(acknowledgedLaneRanks, (byte) 0);
+        }
+
         private boolean keepAlive(long now) {
             return foregroundMask != 0L
                     && now - lastRequestedMs <= FOREGROUND_REQUEST_LEASE_MS;
@@ -1846,10 +2370,15 @@ final class CaveRegionProjectionService {
         private long sequence;
         private long retryAfterMs;
         private boolean inFlight;
+        /** Presentation consumers attached to one content-keyed CPU product. */
+        private final EnumMap<MapRequestLane, CavePresentationGeneration> subscribers =
+                new EnumMap<>(MapRequestLane.class);
+        private boolean backgroundConsumer;
 
         private Request(PageKey key, Level level, long sourceRevision,
                 long repositoryGeneration, MapRequestLane lane, int priority,
-                long sequence) {
+                long sequence,
+                CavePresentationGeneration presentationGeneration) {
             this.key = key;
             this.level = level;
             this.sourceRevision = sourceRevision;
@@ -1857,6 +2386,19 @@ final class CaveRegionProjectionService {
             this.lane = lane;
             this.priority = priority;
             this.sequence = sequence;
+            addSubscriber(lane, presentationGeneration);
+        }
+
+        private void addSubscriber(MapRequestLane lane,
+                CavePresentationGeneration presentationGeneration) {
+            MapRequestLane effective = lane == null
+                    ? MapRequestLane.FULLSCREEN : lane;
+            if (effective == MapRequestLane.BACKGROUND
+                    || effective == MapRequestLane.PREFETCH) {
+                backgroundConsumer = true;
+                return;
+            }
+            subscribers.put(effective, presentationGeneration);
         }
 
         @Override
@@ -1875,11 +2417,15 @@ final class CaveRegionProjectionService {
                 new int[CaveRegionImageCache.PIXEL_COUNT];
         private final long[] pageSourceStamps =
                 new long[CaveRegionImageCache.PAGE_COUNT];
+        private final byte[] pageEmptyProofs =
+                new byte[CaveRegionImageCache.PAGE_COUNT];
         private long pageMask;
         private long version;
         private long lastChangedMs;
         private long dirtySinceMs;
         private long lastWriteAttemptMs;
+        private long lastWrittenPageMask;
+        private long lastWrittenVersion;
         private boolean dirty;
 
         private RegionTransaction(RegionKey key) {
@@ -1887,6 +2433,14 @@ final class CaveRegionProjectionService {
         }
 
         private boolean stage(ProjectedPage page) {
+            boolean hasContent = false;
+            for (int pixel : page.pixels) {
+                if (pixel != 0) {
+                    hasContent = true;
+                    break;
+                }
+            }
+            if (!hasContent && !page.emptyProof().strong()) return false;
             int localPageX = Math.floorMod(page.globalPageX(),
                     CaveRegionImageCache.PAGES_PER_EDGE);
             int localPageZ = Math.floorMod(page.globalPageZ(),
@@ -1909,6 +2463,7 @@ final class CaveRegionProjectionService {
                         CaveTextureAtlas.PAGE_SIZE);
             }
             pageSourceStamps[ordinal] = page.sourceRevision();
+            pageEmptyProofs[ordinal] = (byte) page.emptyProof().persistedCode();
             pageMask |= bit;
             version++;
             long now = System.currentTimeMillis();
@@ -1922,6 +2477,7 @@ final class CaveRegionProjectionService {
             if (pageMask == 0L) return null;
             return new CaveRegionImageCache.RegionImage(key.cacheKey(), pageMask,
                     Arrays.copyOf(pageSourceStamps, pageSourceStamps.length),
+                    Arrays.copyOf(pageEmptyProofs, pageEmptyProofs.length),
                     Arrays.copyOf(pixels, pixels.length), now);
         }
     }

@@ -554,6 +554,13 @@ public class ChunkScanner {
         boolean caveActive = CaveMode.isActive(mc);
         boolean cavePreparing = !caveActive && CaveMode.shouldPrepare(mc);
         synchronizeCaveModeRevision();
+        if (caveActive && mc.screen instanceof MapScreen) {
+            // PASS148: MapScreen Cave uses the stable saved-world snapshot path.
+            // The ordinary player-local live writer resumes after the screen closes;
+            // running it here would mutate source fingerprints beneath fullscreen
+            // exact builds and recreate the stale-result storm.
+            return;
+        }
         if (caveActive) {
             int layerY = CaveMode.getLayerY(mc);
             if (!CaveMode.isFullView(mc)) CaveMapManager.getInstance().setActiveLayer(layerY);
@@ -1209,6 +1216,36 @@ public class ChunkScanner {
         urgentChunkCursors.put(key, cursor & 255);
         if (urgentChunkCursors.size() > 256) urgentChunkCursors.clear();
         return false;
+    }
+
+    /**
+     * Cave-only visible viewport request. This deliberately bypasses the Surface
+     * writer pulse in {@link #scanVisibleArea}: the Cave pipeline must still run its
+     * world-save/Anvil request while Cave owns the screen, but hidden Surface work
+     * must not be resurrected just to reach that request path.
+     *
+     * <p>PASS147 accidentally skipped {@code scanVisibleArea()} whenever Cave was
+     * active in {@code MapViewportCoordinator}. That also skipped
+     * {@code CavePipeline.scanVisibleArea()}, which is the only normal caller that
+     * drives {@code CaveWorldSaveReader -> WorldSaveProjectionPipeline}. The result
+     * was exactly the 14:07 trace: no fullscreen snapshot event, no coherent Cave
+     * source batch, and visible pages filling only from the much slower live archive
+     * scanner. Keep the saved-world reader alive without bringing Surface churn back.</p>
+     */
+    public void scanVisibleCaveArea(Minecraft mc, double minX, double maxX,
+            double minZ, double maxZ, float scale, double focusX, double focusZ,
+            MapRequestLane lane) {
+        if (MapActivityGate.getInstance().blocksForegroundStreaming()) return;
+        if (mc == null || mc.level == null || mc.player == null
+                || !MapManager.getInstance().acceptsLiveLevel(mc.level)
+                || !CaveMode.isActive(mc)) return;
+        synchronizeCaveModeRevision();
+        int layerY = CaveMode.getLayerY(mc);
+        if (!CaveMode.isFullView(mc)) {
+            CaveMapManager.getInstance().setActiveLayer(layerY);
+        }
+        CavePipeline.getInstance().scanVisibleArea(mc, minX, maxX, minZ, maxZ,
+                scale, focusX, focusZ, lane);
     }
 
     /**

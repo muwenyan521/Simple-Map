@@ -50,7 +50,7 @@ final class DecodedWorldRegionCache {
      * higher-priority exact/branch work must be allowed to drain first.
      */
     private static final int SOURCE_CPU_QUEUE_SOFT_LIMIT = 24;
-    private static final int SOURCE_CPU_QUEUE_PRESSURE_LIMIT = 8;
+    private static final int SOURCE_CPU_QUEUE_PRESSURE_LIMIT = 12;
 
     private final LinkedHashMap<RegionKey, DecodedRegion> regions =
             new LinkedHashMap<>(32, 0.75f, true);
@@ -136,12 +136,18 @@ final class DecodedWorldRegionCache {
         if (required <= 0) return true;
         int queueLimit = MapPerformanceGovernor.getInstance().underPressure()
                 ? SOURCE_CPU_QUEUE_PRESSURE_LIMIT : SOURCE_CPU_QUEUE_SOFT_LIMIT;
-        if (MapWorkScheduler.cpuQueuedCount() >= queueLimit) return false;
+        boolean coherentVisiblePage = required >= 8;
+        if (!coherentVisiblePage
+                && decodeWorkers.queuedTasks() >= queueLimit) return false;
         AdaptiveWorldSourceBudget.Snapshot budget = budgetLocked();
         int maximumInFlight = budget.maximumInFlight();
-        if (MapPerformanceGovernor.getInstance().underPressure()) {
-            maximumInFlight = 64;
-        }
+        /*
+         * PASS140: Anvil reads are asynchronous. Frame pressure should reduce CPU
+         * decode/fanout queueing, not collapse visible IO to a tiny window and keep
+         * black Cave pages alive for minutes. Heap pressure is already encoded in
+         * AdaptiveWorldSourceBudget.maximumInFlight(); CPU pressure remains bounded
+         * by the retained source queue and MapWorkScheduler admission.
+         */
         return inFlight + reservedForegroundDecodes + required <= maximumInFlight;
     }
 
@@ -156,12 +162,19 @@ final class DecodedWorldRegionCache {
         if (safeRequired == 0) return new PageReservation(this, 0);
         int queueLimit = MapPerformanceGovernor.getInstance().underPressure()
                 ? SOURCE_CPU_QUEUE_PRESSURE_LIMIT : SOURCE_CPU_QUEUE_SOFT_LIMIT;
-        if (MapWorkScheduler.cpuQueuedCount() >= queueLimit) return null;
+        /*
+         * PASS141: a retained visible page reservation is the dependency that will
+         * remove a black 64x64 hole. Do not let unrelated durable/background decode
+         * backlog prevent the one coherent 4x4 page transaction from even starting.
+         * Reserved leaves still enter the same priority-aware decode adapter and the
+         * shared four-task source CPU permit, so this bypass changes latency rather
+         * than CPU concurrency.
+         */
+        boolean coherentVisiblePage = safeRequired >= 8;
+        if (!coherentVisiblePage
+                && decodeWorkers.queuedTasks() >= queueLimit) return null;
         AdaptiveWorldSourceBudget.Snapshot budget = budgetLocked();
         int maximumInFlight = budget.maximumInFlight();
-        if (MapPerformanceGovernor.getInstance().underPressure()) {
-            maximumInFlight = 64;
-        }
         if (inFlight + reservedForegroundDecodes + safeRequired > maximumInFlight) {
             return null;
         }
@@ -253,16 +266,21 @@ final class DecodedWorldRegionCache {
             int maximumInFlight = budget.maximumInFlight();
             int maximumPrefetch = budget.maximumPrefetch();
             if (MapPerformanceGovernor.getInstance().underPressure()) {
-                // Fullscreen source authority is page-atomic with a 6x6 styling
-                // halo. Retain capacity for at least one complete 36-chunk source
-                // transaction; smaller limits create fragments that cannot publish.
-                maximumInFlight = lane == MapRequestLane.FULLSCREEN
-                        ? 64 : Math.min(maximumInFlight, 4);
+                /*
+                 * PASS140: keep async foreground IO at the heap-derived adaptive
+                 * window. CPU work is separately permit/queue bounded, so cutting
+                 * MINIMAP to eight reads under ordinary frame pressure only turns a
+                 * temporary slow frame into long-lived source holes. Prefetch is
+                 * still aggressively suppressed because it is not a dependency.
+                 */
                 maximumPrefetch = Math.min(maximumPrefetch, 1);
             }
             boolean reserved = reservation != null
                     && reservation.consumeLocked();
+            int queueLimit = MapPerformanceGovernor.getInstance().underPressure()
+                    ? SOURCE_CPU_QUEUE_PRESSURE_LIMIT : SOURCE_CPU_QUEUE_SOFT_LIMIT;
             if (!reserved && (inFlight + reservedForegroundDecodes >= maximumInFlight
+                    || decodeWorkers.queuedTasks() >= queueLimit
                     || (!foreground && inFlightPrefetch >= maximumPrefetch))) {
                 return SourceLease.detached(Result.deferred(), pipelineTelemetry);
             }
@@ -626,7 +644,7 @@ final class DecodedWorldRegionCache {
         private final DecodedRegion region;
         private final int localIndex;
         private final Entry entry;
-        private final MapRequestLane lane;
+        private volatile MapRequestLane lane;
         private final CompletableFuture<Result> future;
         private final MapPipelineTelemetry telemetry;
         private final AtomicBoolean closed = new AtomicBoolean();
@@ -656,6 +674,34 @@ final class DecodedWorldRegionCache {
 
         MapRequestLane lane() {
             return lane;
+        }
+
+        /**
+         * Reclassifies this consumer without releasing the underlying decode.
+         * Durable Cave ingestion uses this to demote a source that just left the
+         * viewport to PREFETCH instead of closing the final lease and cancelling
+         * work that has already paid its admission/read cost.
+         */
+        void reclassify(MapRequestLane replacement) {
+            MapRequestLane effective = replacement == null
+                    ? MapRequestLane.PREFETCH : replacement;
+            if (owner == null || entry == null || closed.get() || lane == effective) {
+                return;
+            }
+            synchronized (owner) {
+                if (closed.get() || owner.regions.get(regionKey) != region
+                        || region.entries[localIndex] != entry || lane == effective) {
+                    return;
+                }
+                int previousIndex = lane.ordinal();
+                if (entry.leaseCounts[previousIndex] > 0) {
+                    entry.leaseCounts[previousIndex]--;
+                }
+                entry.leaseCounts[effective.ordinal()]++;
+                lane = effective;
+                owner.recomputeStrongestLaneLocked(entry);
+                owner.reconcilePrefetchAccountingLocked(entry);
+            }
         }
 
         /** True only for a detached lease rejected by current admission limits. */

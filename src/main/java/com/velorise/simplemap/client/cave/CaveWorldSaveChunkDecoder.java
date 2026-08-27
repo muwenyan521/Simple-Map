@@ -71,6 +71,12 @@ final class CaveWorldSaveChunkDecoder {
         boolean runHadOtherFluid = false;
         boolean runFluidEmissive = false;
         int runFluidColor = 0;
+        int runFluidAlpha = 0;
+        int runFluidY = 0;
+        int runFluidDepth = 0;
+        int runEmissiveColor = 0;
+        int runEmissiveAlpha = 0;
+        int runEmissiveY = 0;
 
         int y = startY;
         while (y >= minimumY) {
@@ -86,9 +92,22 @@ final class CaveWorldSaveChunkDecoder {
                     runHadOtherFluid = false;
                     runFluidEmissive = false;
                     runFluidColor = 0;
+                    runFluidAlpha = 0;
+                    runFluidY = 0;
+                    runFluidDepth = 0;
+                    runEmissiveColor = 0;
+                    runEmissiveAlpha = 0;
+                    runEmissiveY = 0;
                 }
                 runHadWater = true;
                 waterDepth++;
+                int fluidColor = colors.resolveDenseOfflineFluid(state, null);
+                if (fluidColor != 0 && runFluidColor == 0) {
+                    runFluidColor = fluidColor;
+                    runFluidAlpha = visualClassifier.fluidOverlayOpacity(state);
+                    runFluidY = y;
+                }
+                runFluidDepth++;
                 y--;
                 continue;
             }
@@ -102,11 +121,25 @@ final class CaveWorldSaveChunkDecoder {
                     runHadOtherFluid = false;
                     runFluidEmissive = false;
                     runFluidColor = 0;
+                    runFluidAlpha = 0;
+                    runFluidY = 0;
+                    runFluidDepth = 0;
+                    runEmissiveColor = 0;
+                    runEmissiveAlpha = 0;
+                    runEmissiveY = 0;
                 }
                 runHadOtherFluid = true;
                 int fluidColor = colors.resolveDenseOfflineFluid(state, null);
-                if (fluidColor != 0) runFluidColor = fluidColor;
-                if (state.getLightEmission() > 0) runFluidEmissive = true;
+                if (fluidColor != 0 && runFluidColor == 0) {
+                    runFluidColor = fluidColor;
+                    runFluidAlpha = visualClassifier.fluidOverlayOpacity(state);
+                    runFluidY = y;
+                }
+                runFluidDepth++;
+                if (state.getLightEmission() > 0
+                        || visualClassifier.info(state).emissive()) {
+                    runFluidEmissive = true;
+                }
                 y--;
                 continue;
             }
@@ -120,6 +153,12 @@ final class CaveWorldSaveChunkDecoder {
                     runHadOtherFluid = false;
                     runFluidEmissive = false;
                     runFluidColor = 0;
+                    runFluidAlpha = 0;
+                    runFluidY = 0;
+                    runFluidDepth = 0;
+                    runEmissiveColor = 0;
+                    runEmissiveAlpha = 0;
+                    runEmissiveY = 0;
                 }
                 y--;
                 continue;
@@ -129,29 +168,41 @@ final class CaveWorldSaveChunkDecoder {
             MapVisualClassifier.VisualInfo visual = visualClassifier.info(state);
             if (inOpenRun && CaveProjectionSemantics.isOpenDecoration(
                     state, visual, info.collisionEmpty())) {
+                if (visual.emissive() && runEmissiveColor == 0) {
+                    runEmissiveColor = colors.resolveDenseOffline(state, null, 0);
+                    runEmissiveAlpha = visual.overlayOpacity();
+                    runEmissiveY = y;
+                }
                 y--;
                 continue;
             }
 
             if (inOpenRun) {
                 int color = colors.resolveDenseOffline(state, null,
-                        runHadWater ? waterDepth : 0);
+                        0);
                 byte flags = runHadWater ? CaveColumnData.FLAG_WATER : 0;
                 if (runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
-                if (state.getLightEmission() > 0 || runFluidEmissive) {
+                if (state.getLightEmission() > 0) {
                     flags |= CaveColumnData.FLAG_EMISSIVE;
                 }
-                if (runFluidColor != 0) {
-                    color = CaveProjectionSemantics.blendOverlay(
-                            color, runFluidColor, 112);
-                }
-                builder.add(runTopY, y, color, flags);
+                builder.add(runTopY, y, color, flags,
+                        runFluidColor, runFluidAlpha, runFluidY, 0,
+                        runFluidDepth, runFluidEmissive
+                                ? CaveColumnData.FLUID_FLAG_EMISSIVE : 0,
+                        runEmissiveColor, runEmissiveAlpha,
+                        runEmissiveY, 0);
                 inOpenRun = false;
                 waterDepth = 0;
                 runHadWater = false;
                 runHadOtherFluid = false;
                 runFluidEmissive = false;
                 runFluidColor = 0;
+                runFluidAlpha = 0;
+                runFluidY = 0;
+                runFluidDepth = 0;
+                runEmissiveColor = 0;
+                runEmissiveAlpha = 0;
+                runEmissiveY = 0;
             }
             y--;
         }

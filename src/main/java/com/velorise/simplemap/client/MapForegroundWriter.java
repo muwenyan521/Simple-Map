@@ -63,6 +63,18 @@ public final class MapForegroundWriter {
             creditNanos = 0L;
             return;
         }
+        /*
+         * PASS148: while fullscreen Cave owns MapScreen, the visible source is the
+         * one-shot Anvil snapshot transaction. Advancing the live cave writer every
+         * render frame mutates the same repository fingerprints underneath exact
+         * builds and was responsible for hundreds of CAVE_RESULT_STALE discards in
+         * the 14:07 trace. Freeze this player-corridor writer until MapScreen closes;
+         * normal gameplay/minimap resumes it immediately afterwards.
+         */
+        if (minecraft.screen instanceof MapScreen && CaveMode.isActive(minecraft)) {
+            creditNanos = 0L;
+            return;
+        }
 
         long elapsed = Math.max(1_000_000L,
                 Math.min(MAX_ELAPSED_NANOS, now - previous));

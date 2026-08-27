@@ -24,6 +24,9 @@ public final class MapViewportCoordinator {
     private volatile Request minimapRequest;
     private volatile long fullscreenGeneration = 1L;
     private long lastFullscreenRun;
+    /** PASS160: the Cave source cursor is a persistent writer pulse, independent
+     * from render/publication interaction gating. */
+    private long lastFullscreenCaveSourceRun;
     private long lastMinimapRun;
     private long lastLayerUploadRun;
     private long lastAdjacentWarmupRun;
@@ -49,6 +52,9 @@ public final class MapViewportCoordinator {
     private static final int CAVE_BACKGROUND_SURFACE_MAX_RADIUS = 128;
     private static final long LOADED_SURFACE_HALO_INTERVAL_NANOS = 50_000_000L;
     private static final long HIDDEN_CAVE_HALO_INTERVAL_NANOS = 150_000_000L;
+    private static final long CAVE_ADJACENT_WARMUP_INTERVAL_NANOS = 2_000_000_000L;
+    private static final long CAVE_FULLSCREEN_SOURCE_IDLE_INTERVAL_NANOS = 100_000_000L;
+    private static final long CAVE_FULLSCREEN_SOURCE_INTERACT_INTERVAL_NANOS = 250_000_000L;
     private static final long LOADED_SURFACE_HALO_GAME_BUDGET_NANOS = 6_000_000L;
     private static final long LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS = 5_000_000L;
     private LayerStreamState layerStream = new LayerStreamState();
@@ -189,6 +195,7 @@ public final class MapViewportCoordinator {
         MapPublicationCoordinator.getInstance().beginTick();
         lastMinimapRun = 0L;
         lastFullscreenRun = 0L;
+        lastFullscreenCaveSourceRun = 0L;
         lastLayerUploadRun = 0L;
         lastAdjacentWarmupRun = 0L;
         lastBackgroundSurfaceRun = 0L;
@@ -219,6 +226,11 @@ public final class MapViewportCoordinator {
         fullscreenRequest = null;
         fullscreenGeneration++;
         MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
+        UnifiedCaveTextureManager.getInstance().suspendLane(
+                MapRequestLane.FULLSCREEN);
+        CaveWorldSaveReader.getInstance().suspendLane(
+                MapRequestLane.FULLSCREEN);
+        lastFullscreenCaveSourceRun = 0L;
         layerStream = new LayerStreamState();
         MapPerformanceGovernor.getInstance().setFullscreenState(false, false);
     }
@@ -229,6 +241,7 @@ public final class MapViewportCoordinator {
         layerStream = new LayerStreamState();
         MapWorkScheduler.bumpViewport(MapRequestLane.FULLSCREEN);
         MapWorkScheduler.bumpViewport(MapRequestLane.MINIMAP);
+        lastFullscreenCaveSourceRun = 0L;
         lastLayerUploadRun = 0L;
     }
 
@@ -237,6 +250,7 @@ public final class MapViewportCoordinator {
         minimapRequest = null;
         fullscreenGeneration++;
         lastFullscreenRun = 0L;
+        lastFullscreenCaveSourceRun = 0L;
         lastMinimapRun = 0L;
         lastLayerUploadRun = 0L;
         lastAdjacentWarmupRun = 0L;
@@ -283,10 +297,11 @@ public final class MapViewportCoordinator {
         boolean fullscreenVisible = fullscreen != null
                 && fullscreen.generation == fullscreenGeneration
                 && now - fullscreen.submittedNanos < 10_000_000_000L;
-        // The minimap is not visible while MapScreen owns the screen. Xaero keeps
-        // its writer alive near the player but does not spend fullscreen leaf/cache
-        // admission on a hidden minimap render lane. CPU live observation continues
-        // elsewhere; exact cave IO and GPU publication belong to the visible map.
+        // The minimap renderer is hidden while MapScreen owns the screen, but its
+        // bounded Cave presentation subscriber is retained below. Xaero consumes the
+        // World Map MapProcessor product directly for minimap cave chunks; Simple Map
+        // mirrors that with one UnifiedCaveTextureManager product rather than letting
+        // the two views diverge until MapScreen closes.
         Request minimap = minimapRequest;
         tickLoadedPlayerHalo(minecraft, now, fullscreenVisible, publication);
         if (!fullscreenVisible && minimap != null
@@ -295,7 +310,21 @@ public final class MapViewportCoordinator {
             lastMinimapRun = now;
             // Minimap always represents the player's live level.
             if (MapManager.getInstance().isViewingLiveDimension()) {
-                if (profile.allowVisibleScan()) {
+                boolean caveVisibleNow = CaveMode.isActive(minecraft);
+                if (caveVisibleNow) {
+                    if (profile.allowSavedVisible()) {
+                        // PASS148: Cave source acquisition is saved-world work, not
+                        // Surface capture. PASS147 skipped this whole call to remove
+                        // hidden Surface churn and accidentally disabled the active
+                        // CaveWorldSaveReader path. Tie it to allowSavedVisible so
+                        // movement profiles that intentionally disable Anvil IO stay
+                        // loaded-source-only.
+                        ChunkScanner.getInstance().scanVisibleCaveArea(minecraft,
+                                minimap.minX, minimap.maxX,
+                                minimap.minZ, minimap.maxZ, minimap.scale,
+                                minimap.focusX, minimap.focusZ, minimap.lane);
+                    }
+                } else if (profile.allowVisibleScan()) {
                     ChunkScanner.getInstance().scanVisibleArea(minecraft,
                             minimap.minX, minimap.maxX,
                             minimap.minZ, minimap.maxZ, minimap.scale,
@@ -336,6 +365,89 @@ public final class MapViewportCoordinator {
         }
 
 
+        /*
+         * PASS160: source acquisition is a persistent writer, not a one-shot side
+         * effect of a renderer/publication pass. PASS159 could request the first
+         * 32-page Cave window, fill the first rows, then stop permanently because
+         * the next source window was only selected when this coordinator entered
+         * the non-interacting fullscreen publication branch again. Xaero's
+         * MinimapWriter/MapWriter advances its cursor independently under a hard
+         * time/cadence budget. Do the same here: the retained fullscreen request is
+         * enough to advance the Cave source cursor even while composition is being
+         * reused or the viewport is briefly interacting.
+         */
+        boolean fullscreenCaveVisible = fullscreenVisible
+                && CaveMode.isActive(minecraft);
+
+        /*
+         * PASS168 / Xaero parity: while the world-map Cave view is visible there is
+         * exactly one foreground presentation owner. PASS164 kept a hidden MINIMAP
+         * subscriber alive here, which started a second presentation generation and
+         * repeatedly reclassified the same retained region products between MINIMAP
+         * and FULLSCREEN. The 12:55 trace showed that handoff churn while fullscreen
+         * exact residency stayed near zero. The atlas/repository remain shared, so
+         * the minimap reuses finished products when the screen closes without owning
+         * a competing foreground generation while it is hidden.
+         */
+        if (fullscreenCaveVisible && minimap != null
+                && MapManager.getInstance().isViewingLiveDimension()
+                && now - lastHiddenCaveHaloRun
+                        >= HIDDEN_CAVE_HALO_INTERVAL_NANOS) {
+            lastHiddenCaveHaloRun = now;
+            UnifiedCaveTextureManager.getInstance().suspendLane(
+                    MapRequestLane.MINIMAP);
+            CaveWorldSaveReader.getInstance().suspendLane(
+                    MapRequestLane.MINIMAP);
+            MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+            if (recorder.shouldEmitEvent(
+                    "CAVE_FULLSCREEN_HIDDEN_MINIMAP_SUPPRESSED", 1000L)) {
+                recorder.event("CAVE_FULLSCREEN_HIDDEN_MINIMAP_SUPPRESSED",
+                        "top_y=" + CaveMode.getLayerY(minecraft)
+                                + " policy=single_visible_foreground_owner_shared_cache"
+                                + " pass=PASS168");
+            }
+        }
+
+        /*
+         * PASS167: the visible fullscreen Cave writer is a liveness owner, not saved
+         * background work. Do not let ObservationProfile.allowSavedVisible() park it.
+         * The 12:06 trace changed Layered Top-Y with 228 visible pages, advanced only
+         * 26-48 source pages, then emitted no writer pulses while CPU/IO were idle.
+         * Xaero's MapWriter/MinimapWriter keeps its cursor alive every update and
+         * merely shrinks work to the elapsed-time budget. Our source window is already
+         * pressure-bounded (32/16/8 and halved under pressure), so keep pulsing until
+         * the visible cursor closes. Teleport/world handoff quarantine remains the
+         * only foreground hard stop and scanVisibleCaveArea() enforces it again.
+         */
+        if (fullscreenCaveVisible
+                && MapManager.getInstance().isViewingLiveDimension()
+                && !MapActivityGate.getInstance().blocksForegroundStreaming()) {
+            long caveSourceInterval = fullscreen.interacting
+                    ? CAVE_FULLSCREEN_SOURCE_INTERACT_INTERVAL_NANOS
+                    : CAVE_FULLSCREEN_SOURCE_IDLE_INTERVAL_NANOS;
+            if (now - lastFullscreenCaveSourceRun >= caveSourceInterval) {
+                lastFullscreenCaveSourceRun = now;
+                double sourceFocusX = (fullscreen.minX + fullscreen.maxX) * 0.5;
+                double sourceFocusZ = (fullscreen.minZ + fullscreen.maxZ) * 0.5;
+                ChunkScanner.getInstance().scanVisibleCaveArea(minecraft,
+                        fullscreen.minX, fullscreen.maxX,
+                        fullscreen.minZ, fullscreen.maxZ, fullscreen.scale,
+                        sourceFocusX, sourceFocusZ, fullscreen.lane);
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                if (recorder.shouldEmitEvent(
+                        "CAVE_FULLSCREEN_PERSISTENT_WRITER_PULSE", 500L)) {
+                    recorder.event("CAVE_FULLSCREEN_PERSISTENT_WRITER_PULSE",
+                            "interacting=" + fullscreen.interacting
+                                    + " interval_ms=" + caveSourceInterval / 1_000_000L
+                                    + " profile_saved_visible=" + profile.allowSavedVisible()
+                                    + " foreground_liveness=true"
+                                    + " predecessor_policy=retained_cursor_not_render_request"
+                                    + " policy=xaero_persistent_visible_writer"
+                                    + " pass=PASS167");
+                }
+            }
+        }
+
         if (fullscreenVisible && !fullscreen.interacting
                 && now - lastFullscreenRun >= profile.fullscreenIntervalNanos()) {
             lastFullscreenRun = now;
@@ -343,10 +455,9 @@ public final class MapViewportCoordinator {
             // A static dimension has no live ClientLevel to scan. Only saved cache
             // files are streamed; this prevents Overworld blocks being written into
             // a Nether/End/modded-dimension map while browsing it remotely.
-            if (profile.allowVisibleScan()
-                    && MapManager.getInstance().isViewingLiveDimension()) {
-                // Full Map load order is viewport-owned, never cursor-owned.
-                // The mouse remains available to UI inspection only.
+            boolean caveVisibleNow = CaveMode.isActive(minecraft);
+            if (MapManager.getInstance().isViewingLiveDimension()
+                    && !caveVisibleNow && profile.allowVisibleScan()) {
                 double schedulingFocusX = (fullscreen.minX + fullscreen.maxX) * 0.5;
                 double schedulingFocusZ = (fullscreen.minZ + fullscreen.maxZ) * 0.5;
                 ChunkScanner.getInstance().scanVisibleArea(minecraft,
@@ -405,10 +516,24 @@ public final class MapViewportCoordinator {
     private void tickLoadedPlayerHalo(Minecraft minecraft, long now,
             boolean fullscreenVisible, MapPublicationCoordinator publication) {
         if (!MapManager.getInstance().isViewingLiveDimension()) return;
+        boolean caveActive = CaveMode.isActive(minecraft);
+        boolean caveFullscreenVisible = fullscreenVisible && caveActive;
         int renderDistance = Math.max(2,
                 minecraft.options.getEffectiveRenderDistance());
         int radius = Math.max(64, (renderDistance + 1) * 16);
-        if (now - lastLoadedSurfaceHaloRun >= LOADED_SURFACE_HALO_INTERVAL_NANOS) {
+        /*
+         * PASS158: the active projection owns the gameplay foreground budget.
+         * PASS157 still refreshed and published the hidden Surface halo every
+         * 50 ms while the Cave minimap was visible. The latest capture shows
+         * thousands of Surface batches/exact refreshes and 0.7-1.2 GiB/s
+         * allocation during GAME/Cave even when Cave source wait is zero. Xaero
+         * keeps one bounded map writer for the selected projection instead of
+         * rebuilding an invisible alternative map in parallel. Surface catches
+         * up from loaded chunks after Cave is disabled.
+         */
+        if (!caveActive
+                && now - lastLoadedSurfaceHaloRun
+                        >= LOADED_SURFACE_HALO_INTERVAL_NANOS) {
             lastLoadedSurfaceHaloRun = now;
             long budget = fullscreenVisible
                     ? LOADED_SURFACE_HALO_FULLSCREEN_BUDGET_NANOS
@@ -427,7 +552,25 @@ public final class MapViewportCoordinator {
             publication.requestSurface(MapRequestLane.MINIMAP, false);
         }
 
+        if (caveActive) {
+            MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+            if (recorder.shouldEmitEvent(
+                    "PASS158_CAVE_HIDDEN_SURFACE_SUPPRESSED", 2000L)) {
+                recorder.event("CAVE_HIDDEN_SURFACE_WORK_SUPPRESSED",
+                        "surface_halo=false surface_background=false "
+                                + "policy=active_projection_exclusive_foreground "
+                                + "pass=PASS158");
+            }
+        }
+
+        /*
+         * PASS145: when fullscreen Cave is the visible task, the hidden minimap
+         * surface halo and the extra player-centred cave halo add CPU churn but do
+         * not improve the map the user is waiting on. Let the fullscreen viewport
+         * own the source budget exclusively until its visible Cave work closes.
+         */
         if (!fullscreenVisible || !CaveMode.isActive(minecraft)
+                || caveFullscreenVisible
                 || now - lastHiddenCaveHaloRun < HIDDEN_CAVE_HALO_INTERVAL_NANOS) {
             return;
         }
@@ -456,20 +599,16 @@ public final class MapViewportCoordinator {
         boolean caveActive = CaveMode.isActive(minecraft);
         boolean fullscreenVisible = fullscreen != null
                 && now - fullscreen.submittedNanos < 500_000_000L;
-        // Surface fullscreen already owns the visible demand. Cave fullscreen keeps
-        // a slower player-local Surface maintenance lane so switching back does not
-        // expose minutes of unprocessed chunk data.
-        if (!caveActive && fullscreenVisible) return;
-        long interval = caveActive
-                ? CAVE_BACKGROUND_SURFACE_INTERVAL_NANOS
-                : BACKGROUND_SURFACE_INTERVAL_NANOS;
+        // PASS158: Surface fullscreen owns visible Surface demand, while active Cave
+        // owns gameplay foreground exclusively. Hidden Surface maintenance is not
+        // latency-sensitive and resumes when Cave is disabled.
+        if (fullscreenVisible || caveActive) return;
+        long interval = BACKGROUND_SURFACE_INTERVAL_NANOS;
         if (now - lastBackgroundSurfaceRun < interval) return;
         lastBackgroundSurfaceRun = now;
 
         int renderDistance = minecraft.options.renderDistance().get();
-        int maximumRadius = caveActive
-                ? CAVE_BACKGROUND_SURFACE_MAX_RADIUS
-                : BACKGROUND_SURFACE_MAX_RADIUS;
+        int maximumRadius = BACKGROUND_SURFACE_MAX_RADIUS;
         int radius = Math.max(BACKGROUND_SURFACE_MIN_RADIUS,
                 Math.min(maximumRadius, (renderDistance + 1) * 16));
         double centerX = minecraft.player.getX();
@@ -500,10 +639,11 @@ public final class MapViewportCoordinator {
             MapPerformanceGovernor.ObservationProfile profile) {
         if (!profile.allowLayerWarmup() || !CaveMode.isActive(minecraft)
                 || CaveMode.isFullView(minecraft)
+                || MapPerformanceGovernor.getInstance().underPressure()
                 || (fullscreen != null
                         && now - fullscreen.submittedNanos < 500_000_000L)
                 || !MapManager.getInstance().isViewingLiveDimension()) return;
-        if (now - lastAdjacentWarmupRun < 500_000_000L) return;
+        if (now - lastAdjacentWarmupRun < CAVE_ADJACENT_WARMUP_INTERVAL_NANOS) return;
         lastAdjacentWarmupRun = now;
 
         Request source = fullscreen != null && now - fullscreen.submittedNanos < 500_000_000L

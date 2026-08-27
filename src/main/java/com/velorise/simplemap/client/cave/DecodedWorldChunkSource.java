@@ -89,7 +89,21 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
      * payload before any visible cave projection, then reused for Full and every
      * exact Layered Top-Y.
      */
+    private static final int ARCHIVE_COLUMNS_PER_SLICE = 32;
+    private static final int ARCHIVE_VERTICAL_STEPS_PER_SLICE = 64;
+    private static final long ARCHIVE_SLICE_BUDGET_NANOS = 2_000_000L;
+
     private volatile CaveChunkTile.Snapshot verticalArchive;
+    /*
+     * PASS139: decoded .mca Cave archive construction is retained and sliced.
+     * The previous ensureVerticalArchive() scanned all 256 columns in one CPU
+     * continuation; the latest log captured a 1.37 s source-fanout outlier.
+     */
+    private CaveColumnData[] verticalArchiveColumns;
+    private BitSet verticalArchiveScanned;
+    private BitSet verticalArchiveFullHeight;
+    private int verticalArchiveNextColumn;
+    private ArchiveColumnCursor verticalArchiveColumnCursor;
     /** Stable content identity derived from the decoded Anvil payload. */
     private final long sourceRevision;
     /**
@@ -367,13 +381,64 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
          * projection so Full, Layered and CIMG consume identical source authority.
          */
         CaveChunkTile.Snapshot archive = ensureVerticalArchive(token);
-        DenseCaveTile projected = archive == null ? null
-                : CaveArchiveProjector.project(archive, effectiveView,
-                        layerY, tileSource);
+        if (archive == null) {
+            /*
+             * Archive construction is intentionally resumable. Do not bypass the
+             * retained source transaction with a second full-column direct scan;
+             * the caller will retry this already-decoded source after the next
+             * bounded archive slice.
+             */
+            return null;
+        }
+        DenseCaveTile projected = CaveArchiveProjector.project(archive,
+                effectiveView, layerY, tileSource);
         if (projected == null) {
             projected = projector.project(this, effectiveView, layerY,
                     sourceRevision, tileSource, token);
         }
+        caveProjectionCache.put(key, projected);
+        while (caveProjectionCache.size() > MAX_CAVE_PROJECTION_CACHE) {
+            var iterator = caveProjectionCache.entrySet().iterator();
+            if (!iterator.hasNext()) break;
+            iterator.next();
+            iterator.remove();
+        }
+        return projected;
+    }
+
+    /**
+     * PASS141 visible exact-page fast path.
+     *
+     * <p>Xaero's world-save reader decodes the sixteen chunks of one 4x4 map tile
+     * and immediately writes the cave tile for the requested cave start. It does not
+     * require a style-independent all-height archive to finish before the current
+     * layer can become visible. Simple Map previously made every visible WORLD_SAVE
+     * tile wait for all 256 vertical archive columns, then repeatedly re-leased the
+     * same decoded chunk for retained archive slices. That produced minutes-long
+     * black holes even though the NBT was already decoded.</p>
+     *
+     * <p>This method publishes the exact requested Cave representation directly from
+     * the decoded immutable chunk. The durable vertical archive remains an
+     * independent background product owned by the native importer. Both products use
+     * the same source revision and CaveDisplayProjector semantics, so archive
+     * completion never invalidates this already-useful exact tile merely because the
+     * durable representation finished later.</p>
+     */
+    synchronized DenseCaveTile projectCaveImmediate(CaveDisplayProjector projector,
+            CaveView view, int layerY, DenseCaveTile.Source tileSource,
+            MapCancellationToken token) {
+        CaveView effectiveView = view == null ? CaveView.FULL : view;
+        int projectionY = effectiveView == CaveView.FULL
+                ? Integer.MIN_VALUE : layerY;
+        long key = ((long) effectiveView.ordinal() << 32)
+                ^ (projectionY & 0xFFFFFFFFL);
+        DenseCaveTile cached = caveProjectionCache.get(key);
+        if (cached != null) return cached;
+
+        MapCancellationToken effectiveToken = token == null
+                ? new MapCancellationToken(null) : token;
+        DenseCaveTile projected = projector.project(this, effectiveView, layerY,
+                sourceRevision, tileSource, effectiveToken);
         caveProjectionCache.put(key, projected);
         while (caveProjectionCache.size() > MAX_CAVE_PROJECTION_CACHE) {
             var iterator = caveProjectionCache.entrySet().iterator();
@@ -418,227 +483,366 @@ final class DecodedWorldChunkSource implements CaveDisplayProjector.ChunkSource 
             CaveTileRepository repository = CaveTileRepository.getInstance();
             long expectedGeneration = repository.generation();
             if (!repository.isGenerationCurrent(expectedGeneration)) return null;
-            // PASS96 / Xaero-style retained source ownership: a decoded chunk cache
-            // hit must not rebuild + fingerprint the same compact archive again.
-            // Only restore the compact source when its resident LRU entry is absent.
-            if (!CaveArchiveV2Service.getInstance().isResident(
-                    archive.chunkX(), archive.chunkZ())) {
+            CaveArchiveV2Service archiveService =
+                    CaveArchiveV2Service.getInstance();
+            if (!archiveService.isResident(archive.chunkX(), archive.chunkZ())
+                    || archiveService.requiresCurrentSourceVerification(
+                            archive.chunkX(), archive.chunkZ())) {
                 repository.ingestDecodedArchive(archive, expectedGeneration);
             }
             return archive;
         }
+
         MapCancellationToken effectiveToken = token == null
                 ? new MapCancellationToken(null) : token;
-        archive = buildVerticalArchive(effectiveToken);
+        if (verticalArchiveColumns == null) {
+            verticalArchiveColumns =
+                    new CaveColumnData[CaveChunkTile.COLUMN_COUNT];
+            verticalArchiveScanned =
+                    new BitSet(CaveChunkTile.COLUMN_COUNT);
+            verticalArchiveFullHeight =
+                    new BitSet(CaveChunkTile.COLUMN_COUNT);
+            verticalArchiveNextColumn = 0;
+            verticalArchiveColumnCursor = null;
+        }
+
+        long deadline = System.nanoTime() + ARCHIVE_SLICE_BUDGET_NANOS;
+        int completedColumns = 0;
+        while (verticalArchiveNextColumn < CaveChunkTile.COLUMN_COUNT
+                && completedColumns < ARCHIVE_COLUMNS_PER_SLICE
+                && System.nanoTime() < deadline) {
+            effectiveToken.checkpoint("vertical-cave-archive-slice");
+
+            int index = verticalArchiveNextColumn;
+            int localX = index & 15;
+            int localZ = index >>> 4;
+            if (verticalArchiveColumnCursor == null) {
+                verticalArchiveColumnCursor = beginArchiveColumn(
+                        localX, localZ);
+            }
+
+            boolean completed = scanArchiveColumnSlice(
+                    verticalArchiveColumnCursor, effectiveToken, deadline,
+                    ARCHIVE_VERTICAL_STEPS_PER_SLICE);
+            if (!completed) {
+                break;
+            }
+
+            CaveColumnData column = verticalArchiveColumnCursor.completedData;
+            verticalArchiveColumns[index] = column;
+            verticalArchiveScanned.set(index);
+            if (column != null && column.fullHeightComplete()) {
+                verticalArchiveFullHeight.set(index);
+            }
+            verticalArchiveColumnCursor = null;
+            verticalArchiveNextColumn++;
+            completedColumns++;
+        }
+
+        if (verticalArchiveNextColumn < CaveChunkTile.COLUMN_COUNT) {
+            return null;
+        }
+
+        archive = new CaveChunkTile.Snapshot(
+                chunkX, chunkZ, sourceRevision,
+                verticalArchiveScanned,
+                verticalArchiveFullHeight,
+                verticalArchiveColumns);
         effectiveToken.checkpoint("vertical-archive-built");
         CaveTileRepository repository = CaveTileRepository.getInstance();
         long expectedGeneration = repository.generation();
         if (!repository.isGenerationCurrent(expectedGeneration)) return null;
         verticalArchive = archive;
+        verticalArchiveColumns = null;
+        verticalArchiveScanned = null;
+        verticalArchiveFullHeight = null;
+        verticalArchiveNextColumn = 0;
+        verticalArchiveColumnCursor = null;
         repository.mergeWorldSaveTile(archive, expectedGeneration);
         repository.ingestDecodedArchive(archive, expectedGeneration);
         return archive;
     }
 
-    private CaveChunkTile.Snapshot buildVerticalArchive(MapCancellationToken token) {
-        CaveColumnData[] columns = new CaveColumnData[CaveChunkTile.COLUMN_COUNT];
-        BitSet scanned = new BitSet(CaveChunkTile.COLUMN_COUNT);
-        BitSet fullHeight = new BitSet(CaveChunkTile.COLUMN_COUNT);
-        CaveColumnData.Builder builder = new CaveColumnData.Builder();
-        for (int localZ = 0; localZ < 16; localZ++) {
-            token.checkpoint("vertical-cave-archive-row-" + localZ);
-            for (int localX = 0; localX < 16; localX++) {
-                int index = CaveChunkTile.index(localX, localZ);
-                CaveColumnData column = scanArchiveColumn(localX, localZ, builder, token);
-                columns[index] = column;
-                scanned.set(index);
-                if (column.fullHeightComplete()) fullHeight.set(index);
-            }
-        }
-        return new CaveChunkTile.Snapshot(chunkX, chunkZ, sourceRevision,
-                scanned, fullHeight, columns);
+    /** Starts one decoded-Anvil archive column without traversing it synchronously. */
+    private ArchiveColumnCursor beginArchiveColumn(int localX, int localZ) {
+        int top = Math.max(minimumY,
+                Math.min(maximumY - 1, surfaceY(localX, localZ) + 1));
+        return new ArchiveColumnCursor(localX, localZ, minimumY, top);
     }
 
-    private CaveColumnData scanArchiveColumn(int localX, int localZ,
-            CaveColumnData.Builder builder, MapCancellationToken token) {
-        int startY = findArchiveUndergroundStart(localX, localZ);
-        if (startY <= minimumY) {
-            return CaveColumnData.emptyScanned(minimumY, startY, true);
-        }
-        builder.reset();
-        boolean inOpenRun = false;
-        int runTopY = startY;
-        int waterDepth = 0;
-        boolean runHadWater = false;
-        boolean runHadOtherFluid = false;
-        boolean runHadEmissive = false;
-        int runEmissiveColor = 0;
-        int runFluidColor = 0;
+    /**
+     * Advances one decoded archive column in bounded vertical steps. The old
+     * PASS139 outer slice yielded only between columns, so one pathological
+     * modded/deep column could still consume tens or hundreds of milliseconds.
+     * This mirrors the live CaveColumnScanCursor invariant: no full vertical
+     * traversal is an indivisible source-fanout operation.
+     */
+    private boolean scanArchiveColumnSlice(ArchiveColumnCursor cursor,
+            MapCancellationToken token, long deadlineNanos,
+            int maximumSteps) {
+        if (cursor.completedData != null) return true;
         int steps = 0;
-        for (int y = startY; y >= minimumY; y--) {
-            if ((steps++ & 63) == 0) token.checkpoint("vertical-cave-column");
-            byte sectionKind = sectionKind(localX, y, localZ);
-            int sectionBottom = sectionBottom(y);
-            if (sectionKind == CaveTileScanContext.ALL_AIR) {
-                if (!inOpenRun) {
-                    inOpenRun = true;
-                    runTopY = y;
-                    waterDepth = 0;
-                    runHadWater = false;
-                    runHadOtherFluid = false;
-                    runHadEmissive = false;
-                    runEmissiveColor = 0;
-                    runFluidColor = 0;
+        int stepLimit = Math.max(1, maximumSteps);
+        while (steps < stepLimit && System.nanoTime() < deadlineNanos) {
+            token.checkpoint("vertical-cave-column-slice");
+
+            if (cursor.findingTerrainEntry) {
+                if (cursor.y < cursor.minimumY) {
+                    cursor.completedData = CaveColumnData.emptyScanned(
+                            cursor.minimumY, cursor.minimumY, true);
+                    return true;
                 }
-                y = sectionBottom;
+                int y = cursor.y;
+                byte sectionKind = sectionKind(cursor.localX, y, cursor.localZ);
+                int sectionBottom = sectionBottom(y);
+                steps++;
+                if (sectionKind == CaveTileScanContext.ALL_AIR) {
+                    cursor.y = sectionBottom - 1;
+                    continue;
+                }
+                if (sectionKind == CaveTileScanContext.ALL_SOLID_FAST) {
+                    cursor.beginBody(y - 1);
+                } else {
+                    BlockState actual = stateAt(cursor.localX, y, cursor.localZ);
+                    BlockState visualState = visualStateAt(
+                            cursor.localX, y, cursor.localZ, actual);
+                    CaveStateClassifier.StateInfo info = caveGeometry.info(actual);
+                    MapVisualClassifier.VisualInfo visual = visuals.info(visualState);
+                    if (CaveProjectionSemantics.isTerrainEntry(
+                            actual, visual, info.collisionEmpty())) {
+                        cursor.beginBody(y - 1);
+                    } else {
+                        cursor.y--;
+                    }
+                }
+                if (!cursor.findingTerrainEntry
+                        && cursor.startY <= cursor.minimumY) {
+                    cursor.completedData = CaveColumnData.emptyScanned(
+                            cursor.minimumY, cursor.startY, true);
+                    return true;
+                }
+                continue;
+            }
+
+            if (cursor.y < cursor.minimumY) {
+                cursor.completedData = cursor.builder.build(
+                        cursor.minimumY, cursor.startY, true);
+                return true;
+            }
+
+            int y = cursor.y;
+            byte sectionKind = sectionKind(cursor.localX, y, cursor.localZ);
+            int sectionBottom = sectionBottom(y);
+            steps++;
+            if (sectionKind == CaveTileScanContext.ALL_AIR) {
+                if (!cursor.inOpenRun) cursor.beginRun(y);
+                cursor.y = sectionBottom - 1;
                 continue;
             }
             if (sectionKind == CaveTileScanContext.ALL_SOLID_FAST) {
-                if (inOpenRun) {
-                    BlockState floor = visualStateAt(localX, y, localZ);
-                    int color = resolveArchiveFloorColor(floor, localX, y, localZ,
-                            runHadWater ? waterDepth : 0);
-                    byte flags = runHadWater ? CaveColumnData.FLAG_WATER : 0;
-                    if (runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
+                if (cursor.inOpenRun) {
+                    BlockState floor = visualStateAt(
+                            cursor.localX, y, cursor.localZ);
+                    int color = resolveArchiveFloorColor(
+                            floor, cursor.localX, y, cursor.localZ, 0);
+                    byte flags = cursor.runHadWater
+                            ? CaveColumnData.FLAG_WATER : 0;
+                    if (cursor.runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
                     boolean floorEmissive = floor.getLightEmission() > 0
                             || visuals.info(floor).emissive();
-                    if (floorEmissive || runHadEmissive) {
+                    if (floorEmissive || cursor.runHadEmissive) {
                         flags |= CaveColumnData.FLAG_EMISSIVE;
                     }
-                    if (runFluidColor != 0) {
-                        color = CaveProjectionSemantics.blendOverlay(
-                                color, runFluidColor, 112);
-                    }
-                    if (runEmissiveColor != 0) {
-                        color = blendArchiveEmissive(color, runEmissiveColor);
-                    }
-                    builder.add(runTopY, y, color, flags);
-                    inOpenRun = false;
-                    waterDepth = 0;
-                    runHadWater = false;
-                    runHadOtherFluid = false;
-                    runHadEmissive = false;
-                    runEmissiveColor = 0;
-                    runFluidColor = 0;
+                    cursor.builder.add(cursor.runTopY, y, color, flags,
+                            cursor.runFluidColor, cursor.runFluidAlpha,
+                            cursor.runFluidY, cursor.runFluidLight,
+                            cursor.runFluidDepth, cursor.runFluidEmissive
+                                    ? CaveColumnData.FLUID_FLAG_EMISSIVE : 0,
+                            cursor.runEmissiveColor, cursor.runEmissiveAlpha,
+                            cursor.runEmissiveY, cursor.runEmissiveLight);
+                    cursor.resetRun();
                 }
-                y = sectionBottom;
+                cursor.y = sectionBottom - 1;
                 continue;
             }
 
-            BlockState actual = stateAt(localX, y, localZ);
-            BlockState visual = visualStateAt(localX, y, localZ, actual);
+            BlockState actual = stateAt(cursor.localX, y, cursor.localZ);
+            BlockState visual = visualStateAt(
+                    cursor.localX, y, cursor.localZ, actual);
             byte kind = caveGeometry.classify(actual);
             if (kind == CaveStateClassifier.WATER) {
-                if (!inOpenRun) {
-                    inOpenRun = true;
-                    runTopY = y;
-                    waterDepth = 0;
-                    runHadWater = false;
-                    runHadOtherFluid = false;
-                    runHadEmissive = false;
-                    runEmissiveColor = 0;
-                    runFluidColor = 0;
+                if (!cursor.inOpenRun) cursor.beginRun(y);
+                cursor.runHadWater = true;
+                int fluidColor = resolveFluidColor(
+                        visual, cursor.localX, y, cursor.localZ);
+                if (fluidColor != 0 && cursor.runFluidColor == 0) {
+                    cursor.runFluidColor = fluidColor;
+                    cursor.runFluidAlpha = visuals.fluidOverlayOpacity(visual);
+                    cursor.runFluidY = y;
+                    cursor.runFluidLight = Math.max(
+                            visual.getLightEmission(),
+                            lightAt(cursor.localX, y, cursor.localZ));
                 }
-                runHadWater = true;
-                waterDepth++;
+                cursor.runFluidDepth++;
+                cursor.y--;
                 continue;
             }
             if (kind == CaveStateClassifier.OTHER_FLUID) {
-                // Fluid below the terrain roof is an overlay/open cavity. Continue
-                // to the solid floor instead of archiving the fluid block as the
-                // floor itself; this mirrors Xaero's loadPixel underair flow.
-                if (!inOpenRun) {
-                    inOpenRun = true;
-                    runTopY = y;
-                    waterDepth = 0;
-                    runHadWater = false;
-                    runHadOtherFluid = false;
-                    runHadEmissive = false;
-                    runEmissiveColor = 0;
-                    runFluidColor = 0;
+                if (!cursor.inOpenRun) cursor.beginRun(y);
+                cursor.runHadOtherFluid = true;
+                int fluidColor = resolveFluidColor(
+                        visual, cursor.localX, y, cursor.localZ);
+                if (fluidColor != 0 && cursor.runFluidColor == 0) {
+                    cursor.runFluidColor = fluidColor;
+                    cursor.runFluidAlpha = visuals.fluidOverlayOpacity(visual);
+                    cursor.runFluidY = y;
+                    cursor.runFluidLight = Math.max(
+                            visual.getLightEmission(),
+                            lightAt(cursor.localX, y, cursor.localZ));
                 }
-                runHadOtherFluid = true;
-                int fluidColor = resolveFluidColor(visual, localX, y, localZ);
-                if (fluidColor != 0) runFluidColor = fluidColor;
-                if (visual.getLightEmission() > 0 || visuals.info(visual).emissive()) {
-                    runHadEmissive = true;
-                    if (fluidColor != 0) runEmissiveColor = fluidColor;
+                cursor.runFluidDepth++;
+                if (visual.getLightEmission() > 0
+                        || visuals.info(visual).emissive()) {
+                    cursor.runHadEmissive = true;
+                    cursor.runFluidEmissive = true;
                 }
+                cursor.y--;
                 continue;
             }
             if (actual.isAir()) {
-                if (!inOpenRun) {
-                    inOpenRun = true;
-                    runTopY = y;
-                    waterDepth = 0;
-                    runHadWater = false;
-                    runHadOtherFluid = false;
-                    runHadEmissive = false;
-                    runEmissiveColor = 0;
-                    runFluidColor = 0;
-                }
+                if (!cursor.inOpenRun) cursor.beginRun(y);
+                cursor.y--;
                 continue;
             }
 
             CaveStateClassifier.StateInfo info = caveGeometry.info(actual);
             MapVisualClassifier.VisualInfo openVisual = visuals.info(visual);
-            if (inOpenRun && CaveProjectionSemantics.isOpenDecoration(
+            if (cursor.inOpenRun && CaveProjectionSemantics.isOpenDecoration(
                     actual, openVisual, info.collisionEmpty())) {
                 if (visual.getLightEmission() > 0 || openVisual.emissive()) {
-                    runHadEmissive = true;
+                    cursor.runHadEmissive = true;
                     int emissiveColor = resolveBlockColor(
-                            visual, localX, y, localZ);
-                    if (emissiveColor != 0) runEmissiveColor = emissiveColor;
+                            visual, cursor.localX, y, cursor.localZ);
+                    if (emissiveColor != 0 && cursor.runEmissiveColor == 0) {
+                        cursor.runEmissiveColor = emissiveColor;
+                        cursor.runEmissiveAlpha = openVisual.overlayOpacity();
+                        cursor.runEmissiveY = y;
+                        cursor.runEmissiveLight = Math.max(
+                                visual.getLightEmission(),
+                                lightAt(cursor.localX, y, cursor.localZ));
+                    }
                 }
+                cursor.y--;
                 continue;
             }
-            if (inOpenRun) {
-                int color = resolveArchiveFloorColor(visual, localX, y, localZ,
-                        runHadWater ? waterDepth : 0);
-                byte flags = runHadWater ? CaveColumnData.FLAG_WATER : 0;
-                if (runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
+            if (cursor.inOpenRun) {
+                int color = resolveArchiveFloorColor(
+                        visual, cursor.localX, y, cursor.localZ, 0);
+                byte flags = cursor.runHadWater
+                        ? CaveColumnData.FLAG_WATER : 0;
+                if (cursor.runHadOtherFluid) flags |= CaveColumnData.FLAG_FLUID;
                 boolean floorEmissive = visual.getLightEmission() > 0
                         || openVisual.emissive();
-                if (floorEmissive || runHadEmissive) {
+                if (floorEmissive || cursor.runHadEmissive) {
                     flags |= CaveColumnData.FLAG_EMISSIVE;
                 }
-                if (runFluidColor != 0) {
-                    color = CaveProjectionSemantics.blendOverlay(
-                            color, runFluidColor, 112);
-                }
-                if (runEmissiveColor != 0) {
-                    color = blendArchiveEmissive(color, runEmissiveColor);
-                }
-                builder.add(runTopY, y, color, flags);
-                inOpenRun = false;
-                waterDepth = 0;
-                runHadWater = false;
-                runHadOtherFluid = false;
-                runHadEmissive = false;
-                runEmissiveColor = 0;
-                runFluidColor = 0;
+                cursor.builder.add(cursor.runTopY, y, color, flags,
+                        cursor.runFluidColor, cursor.runFluidAlpha,
+                        cursor.runFluidY, cursor.runFluidLight,
+                        cursor.runFluidDepth, cursor.runFluidEmissive
+                                ? CaveColumnData.FLUID_FLAG_EMISSIVE : 0,
+                        cursor.runEmissiveColor, cursor.runEmissiveAlpha,
+                        cursor.runEmissiveY, cursor.runEmissiveLight);
+                cursor.resetRun();
             }
+            cursor.y--;
         }
-        return builder.build(minimumY, startY, true);
+        return false;
+    }
+
+    private static final class ArchiveColumnCursor {
+        private final int localX;
+        private final int localZ;
+        private final int minimumY;
+        private final CaveColumnData.Builder builder =
+                new CaveColumnData.Builder();
+
+        private boolean findingTerrainEntry = true;
+        private int startY;
+        private int y;
+        private boolean inOpenRun;
+        private int runTopY;
+        private boolean runHadWater;
+        private boolean runHadOtherFluid;
+        private boolean runHadEmissive;
+        private boolean runFluidEmissive;
+        private int runFluidColor;
+        private int runFluidAlpha;
+        private int runFluidY;
+        private int runFluidLight;
+        private int runFluidDepth;
+        private int runEmissiveColor;
+        private int runEmissiveAlpha;
+        private int runEmissiveY;
+        private int runEmissiveLight;
+        private CaveColumnData completedData;
+
+        private ArchiveColumnCursor(int localX, int localZ,
+                int minimumY, int topY) {
+            this.localX = localX;
+            this.localZ = localZ;
+            this.minimumY = minimumY;
+            this.startY = topY;
+            this.y = topY;
+            builder.reset();
+        }
+
+        private void beginBody(int firstBodyY) {
+            startY = firstBodyY;
+            y = firstBodyY;
+            findingTerrainEntry = false;
+        }
+
+        private void beginRun(int topY) {
+            inOpenRun = true;
+            runTopY = topY;
+            runHadWater = false;
+            runHadOtherFluid = false;
+            runHadEmissive = false;
+            runFluidEmissive = false;
+            runFluidColor = 0;
+            runFluidAlpha = 0;
+            runFluidY = 0;
+            runFluidLight = 0;
+            runFluidDepth = 0;
+            runEmissiveColor = 0;
+            runEmissiveAlpha = 0;
+            runEmissiveY = 0;
+            runEmissiveLight = 0;
+        }
+
+        private void resetRun() {
+            inOpenRun = false;
+            runHadWater = false;
+            runHadOtherFluid = false;
+            runHadEmissive = false;
+            runFluidEmissive = false;
+            runFluidColor = 0;
+            runFluidAlpha = 0;
+            runFluidY = 0;
+            runFluidLight = 0;
+            runFluidDepth = 0;
+            runEmissiveColor = 0;
+            runEmissiveAlpha = 0;
+            runEmissiveY = 0;
+            runEmissiveLight = 0;
+        }
     }
 
     private int resolveArchiveFloorColor(BlockState state, int localX, int y,
             int localZ, int waterDepth) {
         return colors.resolveDenseOffline(state, biomeAt(localX, y, localZ),
                 Math.max(0, waterDepth));
-    }
-
-    private static int blendArchiveEmissive(int base, int glow) {
-        if (base == 0) return glow;
-        if (glow == 0) return base;
-        int alpha = 112;
-        int inverse = 256 - alpha;
-        int red = ((base & 0xFF) * inverse + (glow & 0xFF) * alpha) >> 8;
-        int green = (((base >>> 8) & 0xFF) * inverse
-                + ((glow >>> 8) & 0xFF) * alpha) >> 8;
-        int blue = (((base >>> 16) & 0xFF) * inverse
-                + ((glow >>> 16) & 0xFF) * alpha) >> 8;
-        return (base & 0xFF000000) | (blue << 16) | (green << 8) | red;
     }
 
     private int findArchiveUndergroundStart(int localX, int localZ) {

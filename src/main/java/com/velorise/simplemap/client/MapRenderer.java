@@ -1035,9 +1035,9 @@ public class MapRenderer {
      */
     private static int caveBranchVisitBudget(float scale) {
         float exactPagePixels = CaveScreenSpacePolicy.exactPagePixels(scale);
-        if (exactPagePixels <= 4.5f) return 512;
-        if (exactPagePixels <= 8.0f) return 1_024;
-        if (exactPagePixels < 16.0f) return 2_048;
+        if (exactPagePixels <= 4.5f) return 128;
+        if (exactPagePixels <= 8.0f) return 256;
+        if (exactPagePixels < 16.0f) return 768;
         return CAVE_BRANCH_PLAN_MAX_VISITS;
     }
 
@@ -1101,7 +1101,13 @@ public class MapRenderer {
 
                     @Override
                     public boolean allowExact(int globalPageX, int globalPageZ) {
-                        return centerOutTraversal
+                        /* PASS170: center-out traversal is a search/order heuristic,
+                         * not permission to bypass the fullscreen presentation
+                         * writer. PASS168/169 used `centerOutTraversal || ...`, so the
+                         * renderer ignored UnifiedCaveTextureManager's publication
+                         * cursor and displayed whichever async page completed first. */
+                        return (renderLane != MapRequestLane.FULLSCREEN
+                                && centerOutTraversal)
                                 || fullCaveTextures.allowFullscreenExact(
                                         globalPageX, globalPageZ);
                     }
@@ -1140,7 +1146,8 @@ public class MapRenderer {
 
                     @Override
                     public boolean allowExact(int globalPageX, int globalPageZ) {
-                        return centerOutTraversal
+                        return (renderLane != MapRequestLane.FULLSCREEN
+                                && centerOutTraversal)
                                 || caveTextures.allowFullscreenExact(caveLayerY,
                                         globalPageX, globalPageZ);
                     }

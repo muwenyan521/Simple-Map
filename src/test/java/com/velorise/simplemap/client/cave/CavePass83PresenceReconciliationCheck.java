@@ -3,20 +3,15 @@ package com.velorise.simplemap.client.cave;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-/** Guards the PASS83 fix that prevents stale known-empty state from hiding Full archive data. */
+/** PASS83 compatibility guard updated for PASS132 transient absence semantics. */
 public final class CavePass83PresenceReconciliationCheck {
     private CavePass83PresenceReconciliationCheck() { }
 
     public static void main(String[] args) throws Exception {
         String repository = Files.readString(Path.of(
                 "src/main/java/com/velorise/simplemap/client/cave/CaveTileRepository.java"));
-        require(repository.contains("if (!knownAbsent[order])")
-                        && repository.contains("previousAbsent == layerY")
-                        && repository.contains("absentDisplayTiles.removeInt(key)"),
-                "resolved-present chunks do not clear stale display absence authority");
-        require(repository.indexOf("if (!knownAbsent[order])")
-                        < repository.indexOf("absentDisplayTiles.put(key, layerY)"),
-                "presence reconciliation is not evaluated before absence publication");
+        require(!repository.contains("absentDisplayTiles"),
+                "transient absence can still be published as display authority");
 
         CaveTileRepository live = CaveTileRepository.getInstance();
         live.clearRuntime(false);
@@ -31,11 +26,13 @@ public final class CavePass83PresenceReconciliationCheck {
                 CaveView.FULL, Integer.MIN_VALUE, pageX, pageZ);
         boolean reconciled = live.commitDisplayPage(java.util.List.of(),
                 CaveView.FULL, Integer.MIN_VALUE, firstChunkX, firstChunkZ,
-                new boolean[16], generation);
+                generation);
         long presentRevision = live.getPageRevision(
                 CaveView.FULL, Integer.MIN_VALUE, pageX, pageZ);
-        require(reconciled && presentRevision != absentRevision,
-                "resolved-present page did not remove stale Full known-empty authority");
+        require(!reconciled && presentRevision == absentRevision
+                        && !live.hasProjectionAuthorityPage(CaveView.FULL,
+                                Integer.MIN_VALUE, pageX, pageZ),
+                "disk absence created a Full known-empty authority transition");
         System.out.println("CAVE_PASS83_PRESENCE_RECONCILIATION_PASS");
     }
 

@@ -42,14 +42,14 @@ final class CaveRegionStore {
      * v5 invalidates raw archives whose live Full-Cave entry scan still required
      * a multi-solid roof instead of Xaero-style first real terrain entry.
      */
-    private static final int REGION_VERSION = 5;
+    private static final int REGION_VERSION = CaveCacheSchema.RAW_REGION_VERSION;
     private static final int RECORD_MAGIC = 0x54494C45; // TILE
     private static final int REGION_HEADER_BYTES = Integer.BYTES * 2;
     private static final int RECORD_HEADER_BYTES = Integer.BYTES * 5;
     private static final int MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
     private static final int SNAPSHOT_MAGIC = 0x43565434; // CVT4
-    private static final int SNAPSHOT_VERSION = 8;
+    private static final int SNAPSHOT_VERSION = CaveCacheSchema.RAW_SNAPSHOT_VERSION;
 
     /** Compaction is deliberately conservative because it is maintenance IO. */
     private static final long COMPACT_MIN_FILE_BYTES = Math.max(1L << 20,
@@ -448,6 +448,16 @@ final class CaveRegionStore {
                     output.writeShort(column.bottomY(run));
                     output.writeInt(column.color(run));
                     output.writeByte(column.flags(run));
+                    output.writeInt(column.fluidColor(run));
+                    output.writeByte(column.fluidAlpha(run));
+                    output.writeShort(column.fluidY(run));
+                    output.writeByte(column.fluidLight(run));
+                    output.writeByte(column.fluidDepth(run));
+                    output.writeByte(column.fluidFlags(run));
+                    output.writeInt(column.emissiveColor(run));
+                    output.writeByte(column.emissiveAlpha(run));
+                    output.writeShort(column.emissiveY(run));
+                    output.writeByte(column.emissiveLight(run));
                 }
             }
         }
@@ -487,17 +497,40 @@ final class CaveRegionStore {
                 short[] bottoms = new short[count];
                 int[] colors = new int[count];
                 byte[] flags = new byte[count];
+                int[] fluidColors = new int[count];
+                byte[] fluidAlpha = new byte[count];
+                short[] fluidY = new short[count];
+                byte[] fluidLight = new byte[count];
+                byte[] fluidDepth = new byte[count];
+                byte[] fluidFlags = new byte[count];
+                int[] emissiveColors = new int[count];
+                byte[] emissiveAlpha = new byte[count];
+                short[] emissiveY = new short[count];
+                byte[] emissiveLight = new byte[count];
                 for (int run = 0; run < count; run++) {
                     tops[run] = input.readShort();
                     bottoms[run] = input.readShort();
                     colors[run] = input.readInt();
                     flags[run] = input.readByte();
+                    fluidColors[run] = input.readInt();
+                    fluidAlpha[run] = input.readByte();
+                    fluidY[run] = input.readShort();
+                    fluidLight[run] = input.readByte();
+                    fluidDepth[run] = input.readByte();
+                    fluidFlags[run] = input.readByte();
+                    emissiveColors[run] = input.readInt();
+                    emissiveAlpha[run] = input.readByte();
+                    emissiveY[run] = input.readShort();
+                    emissiveLight[run] = input.readByte();
                 }
                 boolean completeHeight = fullHeight.get(index);
                 columns[index] = count == 0
                         ? CaveColumnData.emptyScanned(
                                 scannedMinimumY, scannedMaximumY, completeHeight)
-                        : new CaveColumnData(tops, bottoms, colors, flags, count,
+                        : new CaveColumnData(tops, bottoms, colors, flags,
+                                fluidColors, fluidAlpha, fluidY, fluidLight,
+                                fluidDepth, fluidFlags, emissiveColors,
+                                emissiveAlpha, emissiveY, emissiveLight, count,
                                 scannedMinimumY, scannedMaximumY, completeHeight);
             }
             return new CaveChunkTile.Snapshot(storedX, storedZ,
@@ -514,11 +547,12 @@ final class CaveRegionStore {
 
     /**
      * CVR stores resolved material colours, so it is not safe to share between
-     * Accurate and Vanilla colour modes. c5 also invalidates archives written
+     * Accurate and Vanilla colour modes. The Cave epoch also invalidates archives written
      * before Surface-equivalent Accurate input and raw archive shading.
      */
     private static String colourNamespacePrefix() {
-        return "c5-m" + Math.max(0, MapConfig.blockColourMode) + "-";
+        return "c" + CaveCacheSchema.EPOCH + "-m"
+                + Math.max(0, MapConfig.blockColourMode) + "-";
     }
 
     private static Object regionLock(File file) {

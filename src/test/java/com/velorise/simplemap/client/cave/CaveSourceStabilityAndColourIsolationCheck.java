@@ -44,7 +44,7 @@ public final class CaveSourceStabilityAndColourIsolationCheck {
                 "SMR2 archive replay still marks raw colours as pre-lit");
         require(!repository.contains("column.flags(run)\n                                        | DenseCaveTile.FLAG_PRELIT_LEGACY"),
                 "CVR compatibility replay still marks raw colours as pre-lit");
-        require(lodTree.contains("cave_v11_"),
+        require(lodTree.contains("cave_v12_"),
                 "old cave branch pixels can still replay after region-transaction migration");
         require(persistence.contains("caveArchiveStyleSignature"),
                 "SMR2 cave archive is not colour-schema isolated");

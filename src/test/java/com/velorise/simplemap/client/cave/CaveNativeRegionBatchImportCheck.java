@@ -2,8 +2,6 @@ package com.velorise.simplemap.client.cave;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
-import java.util.Set;
 
 /** PASS76 guard for native-region source ownership and bounded region projection. */
 public final class CaveNativeRegionBatchImportCheck {
@@ -19,10 +17,9 @@ public final class CaveNativeRegionBatchImportCheck {
         long[] chunkMask = new long[16];
         int local = 7 * 32 + 5;
         chunkMask[local >>> 6] |= 1L << (local & 63);
-        AnvilPagePresenceIndex.Snapshot snapshot =
-                new AnvilPagePresenceIndex.Snapshot(Set.of(),
-                        Map.of(CaveLoadHierarchy.pack(3, -2), chunkMask),
-                        1L, 1, 1, true);
+        AnvilPagePresenceIndex.RegionSnapshot snapshot =
+                new AnvilPagePresenceIndex.RegionSnapshot(
+                        3, -2, 1L, 11L, chunkMask, 1, true);
         require(snapshot.hasChunk(3 * 32 + 5, -2 * 32 + 7),
                 "generated chunk bitmap lost a present header entry");
         require(!snapshot.hasChunk(3 * 32 + 6, -2 * 32 + 7),
@@ -48,12 +45,13 @@ public final class CaveNativeRegionBatchImportCheck {
                         && importer.contains("caveRequiredSources")
                         && importer.contains("generatedPageMask()")
                         && importer.contains("retainProjection(requestedView, requestedTopY)")
-                        && importer.contains("requiredSourcesReady()")
-                        && importer.contains("CAVE_NATIVE_REGION_SOURCE_READY")
+                        && importer.contains("requiredSourcesSettledForPass()")
+                        && importer.contains("CAVE_NATIVE_REGION_SOURCE_SETTLED")
                         && importer.contains("cancelUnneededSourcesLocked()")
                         && importer.contains("archive.hasFullProjectionChunk")
                         && importer.contains("archive.hasCompleteChunk")
-                        && importer.contains("applyPresence(presenceSnapshot)"),
+                        && importer.contains("refreshPresence(presenceIndex")
+                        && importer.contains("applyPresenceDelta(snapshot"),
                 "native region import does not own/cancel source or reuse retained archive authority");
         require(projection.contains("REGION_PAGE_SLICE = 24")
                         && projection.contains("regionQueue")
@@ -63,7 +61,8 @@ public final class CaveNativeRegionBatchImportCheck {
                         && projection.contains("releaseForegroundBatchLocked")
                         && projection.contains("stageRegionLocked(page)"),
                 "region projection is not sliced or background pages can flood GPU publication");
-        require(presence.contains("long[] presence = new long[16]")
+        require(presence.contains("long[] bits = new long[16]")
+                        && presence.contains("RegionSnapshot")
                         && presence.contains("boolean hasChunk(int chunkX, int chunkZ)"),
                 "Anvil header presence is not reused to resolve absent chunks without NBT reads");
         require(importer.contains("CAVE_NATIVE_REGION_VISIBLE_SOURCE_READY")

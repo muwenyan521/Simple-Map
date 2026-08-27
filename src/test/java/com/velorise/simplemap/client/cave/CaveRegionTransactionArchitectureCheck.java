@@ -88,7 +88,7 @@ public final class CaveRegionTransactionArchitectureCheck {
                         && !archive.contains("indexedRevision >= compact.revision()"),
                 "content fingerprints are still compared as counters");
         require(cimg.contains("private static final int VERSION = 8;")
-                        && lod.contains("cave_v11_")
+                        && lod.contains("cave_v12_")
                         && scheduler.contains("REGION_PROJECTION(88, true)"),
                 "old presentation generations can replay into PASS75");
     }

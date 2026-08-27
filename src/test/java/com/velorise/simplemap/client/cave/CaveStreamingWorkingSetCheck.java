@@ -67,8 +67,11 @@ public final class CaveStreamingWorkingSetCheck {
                         && loadPlanner.contains("MINIMAP_MAX_RADIUS_PAGES = 10")
                         && loadPlanner.contains("minimapWorkingRadiusPages"),
                 "atomic cave source assembly or loaded minimap working set regressed");
-        require(worldReader.contains("anvilPresence.snapshot(serverLevel)")
-                        && worldReader.contains("applySourceFilter")
+        require(!worldReader.contains("anvilPresence.snapshot(serverLevel)")
+                        && anvilIndex.contains("MAX_CACHE = 256")
+                        && anvilIndex.contains("getCached(ServerLevel level")
+                        && anvilIndex.contains("requestAsync(ServerLevel level")
+                        && anvilIndex.contains("MapWorkScheduler.tryIoFuture")
                         && anvilIndex.contains("HEADER_BYTES = 4_096")
                         && anvilIndex.contains("header.getInt() == 0")
                         && sourceCache.contains("PageReservation")

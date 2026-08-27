@@ -1,5 +1,6 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.MapDebugRecorder;
 import net.minecraft.world.level.Level;
 
 import java.util.HashMap;
@@ -25,6 +26,7 @@ public final class CaveTileScheduler {
     private static final int MAX_TASKS = 4096;
     private static final int MAX_HEAP_TASKS = MAX_TASKS * 4;
     private static final long VIEWPORT_REFRESH_NANOS = 200_000_000L;
+    private static final int COLUMN_VERTICAL_BURST = 16;
 
     private final CaveTileRepository repository;
     private final CaveTileScanner scanner;
@@ -109,6 +111,9 @@ public final class CaveTileScheduler {
         Task task = new Task(key, chunkX, chunkZ, priority,
                 repository.generation(), sequence++, lane,
                 lane == Lane.VIEWPORT ? expectedViewportGeneration : 0L);
+        if (existing != null && existing.generation == task.generation) {
+            task.copyCursorFrom(existing);
+        }
         queued.put(key, task);
         queue.offer(task);
         if (queue.size() > MAX_HEAP_TASKS) compactHeap();
@@ -166,48 +171,96 @@ public final class CaveTileScheduler {
                     || !level.hasChunk(task.chunkX, task.chunkZ)) continue;
 
             CaveChunkTile tile = repository.getOrCreateLiveTile(task.chunkX, task.chunkZ);
-            CaveTileScanContext context = CaveTileScanContext.create(
-                    level, task.chunkX, task.chunkZ);
-            if (context == null) continue;
-
-            int processedThisTask = 0;
-            boolean tileChanged = false;
-            while (System.nanoTime() < deadlineNanos) {
-                int column = tile.nextPendingColumn();
-                if (column < 0) break;
-                boolean revalidation = tile.isColumnScanned(column & 15, column >>> 4);
-                int blockX = (task.chunkX << 4) + (column & 15);
-                int blockZ = (task.chunkZ << 4) + (column >>> 4);
-                long started = System.nanoTime();
-                CaveColumnData data = scanner.scanColumn(
-                        level, blockX, blockZ, context);
-                long elapsed = System.nanoTime() - started;
-                if (data == null) break;
-                boolean changed = repository.commitColumnDeferred(tile, column, data);
-                tileChanged |= changed;
-                telemetry.recordColumnScan(elapsed, revalidation, changed);
-                columns++;
-                processedThisTask++;
-                // Finish coherent tile bursts, but yield near the frame deadline.
-                if (processedThisTask >= 64
-                        && System.nanoTime() + 150_000L >= deadlineNanos) break;
+            tile.markLiveScanning();
+            if (task.activeContext == null) {
+                task.activeContext = CaveTileScanContext.create(
+                        level, task.chunkX, task.chunkZ);
             }
-            if (tileChanged) repository.publishTileChanges(tile);
-            if (tile.needsScanWork()) {
+            if (task.activeContext == null) continue;
+
+            while (System.nanoTime() < deadlineNanos) {
+                if (task.activeColumn < 0) {
+                    int column = tile.nextPendingColumn();
+                    if (column < 0) break;
+                    int blockX = (task.chunkX << 4) + (column & 15);
+                    int blockZ = (task.chunkZ << 4) + (column >>> 4);
+                    CaveColumnScanCursor cursor = scanner.beginColumn(
+                            level, blockX, blockZ, task.activeContext);
+                    if (cursor == null) {
+                        task.activeContext = null;
+                        break;
+                    }
+                    task.activeColumn = column;
+                    task.activeCursor = cursor;
+                    task.activeRevalidation = tile.isColumnScanned(
+                            column & 15, column >>> 4);
+                    task.activeColumnScanNanos = 0L;
+                }
+
+                long sliceStarted = System.nanoTime();
+                CaveTileScanner.ScanSliceResult result = scanner.scanColumnSlice(
+                        level, task.activeCursor, deadlineNanos,
+                        COLUMN_VERTICAL_BURST);
+                long sliceNanos = System.nanoTime() - sliceStarted;
+                task.activeColumnScanNanos += sliceNanos;
+                boolean paused = result == CaveTileScanner.ScanSliceResult.PAUSED;
+                telemetry.recordArchiveScanSlice(sliceNanos,
+                        task.activeCursor.lastSliceSteps(), paused);
+                recordSliceEvent(task, sliceNanos, paused);
+
+                if (result == CaveTileScanner.ScanSliceResult.INVALIDATED) {
+                    task.clearActiveColumn();
+                    task.activeContext = null;
+                    break;
+                }
+                if (paused) {
+                    // The cursor remains private task state. Requeueing cannot expose
+                    // a half-scanned column to the repository or compact archive.
+                    requeue(task);
+                    task = null;
+                    break;
+                }
+
+                int column = task.activeColumn;
+                CaveColumnData data = task.activeCursor.completedData();
+                boolean changed = repository.commitColumnDeferred(tile, column, data);
+                telemetry.recordInternalArchiveColumnCommit();
+                telemetry.recordColumnScan(task.activeColumnScanNanos,
+                        task.activeRevalidation, changed);
+                columns++;
+                task.clearActiveColumn();
+                if (changed) repository.publishTileChanges(tile);
+            }
+            if (task != null && tile.needsScanWork()) {
                 /*
                  * A partially completed tile is cheaper and visually more useful to
                  * finish than starting another tile. Promote continuation according
                  * to the number of committed columns. Background/revalidation work
                  * cannot outrank visible foreground or viewport lanes.
                  */
-                int continuationBoost = Math.min(12_000,
-                        tile.scannedColumnCount() * 40);
-                enqueueInternal(task.chunkX, task.chunkZ,
-                        Math.max(1, task.priority + continuationBoost),
-                        task.lane, task.viewportGeneration);
+                requeue(task);
             }
         }
         return columns;
+    }
+
+    private void requeue(Task task) {
+        if (task == null || queued.containsKey(task.key)) return;
+        queued.put(task.key, task);
+        queue.offer(task);
+        if (queue.size() > MAX_HEAP_TASKS) compactHeap();
+    }
+
+    private static void recordSliceEvent(Task task, long elapsedNanos,
+            boolean paused) {
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (!recorder.shouldEmitEvent("CAVE_ARCHIVE_SCAN_SLICE", 250L)) return;
+        recorder.event("CAVE_ARCHIVE_SCAN_SLICE",
+                "chunk=" + task.chunkX + ',' + task.chunkZ
+                        + " column=" + task.activeColumn
+                        + " steps=" + task.activeCursor.lastSliceSteps()
+                        + " elapsed_us=" + elapsedNanos / 1_000L
+                        + " paused=" + paused);
     }
 
     private boolean updateViewportGeneration(int minChunkX, int maxChunkX,
@@ -289,6 +342,11 @@ public final class CaveTileScheduler {
         private final long sequence;
         private final Lane lane;
         private final long viewportGeneration;
+        private int activeColumn = -1;
+        private CaveColumnScanCursor activeCursor;
+        private CaveTileScanContext activeContext;
+        private boolean activeRevalidation;
+        private long activeColumnScanNanos;
 
         private Task(long key, int chunkX, int chunkZ, int priority,
                 long generation, long sequence, Lane lane,
@@ -301,6 +359,21 @@ public final class CaveTileScheduler {
             this.sequence = sequence;
             this.lane = lane;
             this.viewportGeneration = viewportGeneration;
+        }
+
+        private void copyCursorFrom(Task source) {
+            activeColumn = source.activeColumn;
+            activeCursor = source.activeCursor;
+            activeContext = source.activeContext;
+            activeRevalidation = source.activeRevalidation;
+            activeColumnScanNanos = source.activeColumnScanNanos;
+        }
+
+        private void clearActiveColumn() {
+            activeColumn = -1;
+            activeCursor = null;
+            activeRevalidation = false;
+            activeColumnScanNanos = 0L;
         }
 
         @Override

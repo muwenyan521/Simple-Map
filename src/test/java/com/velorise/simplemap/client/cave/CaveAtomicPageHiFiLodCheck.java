@@ -48,8 +48,8 @@ public final class CaveAtomicPageHiFiLodCheck {
                         && !archive.contains("indexedRevision >= compact.revision()"),
                 "archive fingerprints are still treated as monotonic counters");
         require(scheduler.contains("&& !evictWeakViewportTask(priority)")
-                        && policy.contains("MINIMAP) normal = pressured ? 8 : 32")
-                        && policy.contains("MINIMAP) normal = pressured ? 6 : 20")
+                        && policy.contains("MINIMAP) normal = pressured ? 2 : 4")
+                        && policy.contains("MINIMAP) normal = pressured ? 2 : 6")
                         && surfaceManager.contains("? 8 : 24")
                         && !surfaceManager.contains("Math.min(4, 8 - active)"),
                 "player-centred minimap demand can still be starved by fullscreen work");

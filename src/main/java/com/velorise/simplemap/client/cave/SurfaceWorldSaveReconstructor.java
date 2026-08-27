@@ -50,6 +50,14 @@ final class SurfaceWorldSaveReconstructor {
     private final ConcurrentLinkedQueue<ReadyProjection> readyApplications =
             new ConcurrentLinkedQueue<>();
     private final AtomicInteger readyApplicationCount = new AtomicInteger();
+    /*
+     * PASS139: source projection continuations share the same bounded retained
+     * adapter as Cave source fanout. This avoids one delayed scheduler retry chain
+     * per completed Anvil chunk when the global CPU domain is saturated.
+     */
+    private final PriorityDecodeExecutor projectionWorkers =
+            new PriorityDecodeExecutor(
+                    MapWorkScheduler.WorkType.SOURCE_PROJECTION, 10);
     /* Client-thread-only commit scratch. commitSurfaceChunkSlice() copies values
      * synchronously under the Region lock, so one reusable 256-column transaction
      * avoids three fresh primitive arrays for every reconstructed Anvil chunk. */
@@ -129,9 +137,8 @@ final class SurfaceWorldSaveReconstructor {
             readyApplicationCount.incrementAndGet();
             readyApplications.offer(new ReadyProjection(
                     key, generation, columns, lane, 0L));
-        }, MapWorkScheduler.cpuExecutor(sourceLease.lane(),
-                MapWorkScheduler.WorkType.SOURCE_PROJECTION,
-                sourceLease.lane().priorityBase(), 10, () -> true)).exceptionally(throwable -> {
+        }, projectionWorkers.dynamic(sourceLease.lane()::executorPriority))
+                .exceptionally(throwable -> {
             pending.remove(key);
             sourceLease.close();
             return null;

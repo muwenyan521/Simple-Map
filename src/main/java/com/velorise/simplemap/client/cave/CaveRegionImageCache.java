@@ -1,8 +1,5 @@
 package com.velorise.simplemap.client.cave;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -30,12 +27,13 @@ import java.util.zip.CRC32;
  * stale pages continue through the authoritative CVD/Anvil pipeline.</p>
  */
 public final class CaveRegionImageCache {
-    private static final Logger LOGGER = LogManager.getLogger();
+    private static final System.Logger LOGGER = System.getLogger(
+            CaveRegionImageCache.class.getName());
     private static final CaveRegionImageCache INSTANCE =
             new CaveRegionImageCache();
 
     private static final int MAGIC = 0x43494D47; // CIMG
-    private static final int VERSION = 8;
+    private static final int VERSION = CaveCacheSchema.REGION_IMAGE_VERSION;
     public static final int REGION_PIXELS = 512;
     public static final int PAGE_PIXELS = 64;
     public static final int PAGES_PER_EDGE = REGION_PIXELS / PAGE_PIXELS;
@@ -60,7 +58,8 @@ public final class CaveRegionImageCache {
         File next = v4TileDirectory == null
                 ? null : new File(v4TileDirectory, "cave_img");
         if (next != null && !next.exists() && !next.mkdirs()) {
-            LOGGER.warn("Could not create cave image cache directory {}", next);
+            LOGGER.log(System.Logger.Level.WARNING,
+                    "Could not create cave image cache directory {0}", next);
         }
         baseDirectory = next;
         generation.incrementAndGet();
@@ -96,6 +95,8 @@ public final class CaveRegionImageCache {
             for (int page = 0; page < PAGE_COUNT; page++) {
                 pageSourceStamps[page] = input.readLong();
             }
+            byte[] pageEmptyProofs = input.readNBytes(PAGE_COUNT);
+            if (pageEmptyProofs.length != PAGE_COUNT) return null;
             int bodyBytes = input.readInt();
             int expectedCrc = input.readInt();
             if (dimensionHash != key.dimension().hashCode()
@@ -111,6 +112,7 @@ public final class CaveRegionImageCache {
             byte[] body = input.readNBytes(bodyBytes);
             if (body.length != bodyBytes) return null;
             CRC32 crc = new CRC32();
+            crc.update(pageEmptyProofs);
             crc.update(body);
             if ((int) crc.getValue() != expectedCrc) return null;
             int[] pixels = new int[PIXEL_COUNT];
@@ -118,12 +120,14 @@ public final class CaveRegionImageCache {
             for (int index = 0; index < pixels.length; index++) {
                 pixels[index] = buffer.getInt();
             }
-            return new RegionImage(key, pageMask, pageSourceStamps, pixels,
+            return new RegionImage(key, pageMask, pageSourceStamps,
+                    pageEmptyProofs, pixels,
                     Math.max(0L, file.lastModified()));
         } catch (EOFException ignored) {
             return null;
         } catch (IOException | RuntimeException failure) {
-            LOGGER.debug("Could not read cave image cache {}", file, failure);
+            LOGGER.log(System.Logger.Level.DEBUG,
+                    "Could not read cave image cache " + file, failure);
             return null;
         }
     }
@@ -141,6 +145,7 @@ public final class CaveRegionImageCache {
         buffer.clear();
         for (int pixel : image.pixels()) buffer.putInt(pixel);
         CRC32 crc = new CRC32();
+        crc.update(image.pageEmptyProofs());
         crc.update(body);
         File temporary = new File(parent, file.getName() + ".tmp."
                 + Long.toUnsignedString(Thread.currentThread().getId()));
@@ -163,12 +168,14 @@ public final class CaveRegionImageCache {
             for (long sourceStamp : image.pageSourceStamps()) {
                 output.writeLong(sourceStamp);
             }
+            output.write(image.pageEmptyProofs());
             output.writeInt(body.length);
             output.writeInt((int) crc.getValue());
             output.write(body);
         } catch (IOException failure) {
             temporary.delete();
-            LOGGER.debug("Could not write cave image cache {}", file, failure);
+            LOGGER.log(System.Logger.Level.DEBUG,
+                    "Could not write cave image cache " + file, failure);
             return false;
         }
 
@@ -184,7 +191,8 @@ public final class CaveRegionImageCache {
             return true;
         } catch (IOException failure) {
             temporary.delete();
-            LOGGER.debug("Could not publish cave image cache {}", file, failure);
+            LOGGER.log(System.Logger.Level.DEBUG,
+                    "Could not publish cave image cache " + file, failure);
             return false;
         }
     }
@@ -218,7 +226,7 @@ public final class CaveRegionImageCache {
     }
 
     public record RegionImage(Key key, long pageMask, long[] pageSourceStamps,
-            int[] pixels, long sourceTimestampMs) {
+            byte[] pageEmptyProofs, int[] pixels, long sourceTimestampMs) {
         public RegionImage {
             if (key == null) throw new IllegalArgumentException("key is required");
             if (pageSourceStamps == null || pageSourceStamps.length != PAGE_COUNT) {
@@ -227,6 +235,12 @@ public final class CaveRegionImageCache {
             }
             pageSourceStamps = java.util.Arrays.copyOf(
                     pageSourceStamps, pageSourceStamps.length);
+            if (pageEmptyProofs == null || pageEmptyProofs.length != PAGE_COUNT) {
+                throw new IllegalArgumentException(
+                        "CIMG requires exactly " + PAGE_COUNT + " empty proofs");
+            }
+            pageEmptyProofs = java.util.Arrays.copyOf(
+                    pageEmptyProofs, pageEmptyProofs.length);
             if (pixels == null || pixels.length != PIXEL_COUNT) {
                 throw new IllegalArgumentException(
                         "CIMG requires exactly " + PIXEL_COUNT + " pixels");
@@ -237,6 +251,11 @@ public final class CaveRegionImageCache {
         public long[] pageSourceStamps() {
             return java.util.Arrays.copyOf(
                     pageSourceStamps, pageSourceStamps.length);
+        }
+
+        @Override
+        public byte[] pageEmptyProofs() {
+            return java.util.Arrays.copyOf(pageEmptyProofs, pageEmptyProofs.length);
         }
 
         public boolean hasPage(int localPageX, int localPageZ) {
@@ -250,6 +269,13 @@ public final class CaveRegionImageCache {
             if (!hasPage(localPageX, localPageZ)) return 0L;
             int ordinal = localPageZ * PAGES_PER_EDGE + localPageX;
             return pageSourceStamps[ordinal];
+        }
+
+        public CaveEmptyProof pageEmptyProof(int localPageX, int localPageZ) {
+            if (!hasPage(localPageX, localPageZ)) return CaveEmptyProof.NONE;
+            int ordinal = localPageZ * PAGES_PER_EDGE + localPageX;
+            return CaveEmptyProof.fromPersistedCode(
+                    Byte.toUnsignedInt(pageEmptyProofs[ordinal]));
         }
     }
 }

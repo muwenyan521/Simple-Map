@@ -36,7 +36,7 @@ final class CaveDisplayProjector {
             }
         }
         effectiveToken.checkpoint("cave-project-tile-ready");
-        return builder.build(source.chunkX(), source.chunkZ(), view,
+        return builder.buildOwned(source.chunkX(), source.chunkZ(), view,
                 layerY, layerY, revision, tileSource);
     }
 

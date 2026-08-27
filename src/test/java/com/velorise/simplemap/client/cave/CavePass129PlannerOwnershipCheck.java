@@ -14,9 +14,11 @@ public final class CavePass129PlannerOwnershipCheck {
 
         require(manager.contains("CAVE_REQUEST_EXPIRED_VIEWPORT_RETAINED")
                         && manager.contains("CAVE_COMPLETION_NO_LONGER_OWNED")
-                        && manager.contains("isProjectionStillOwned(\n                            info.key, result.projectionTopY(), now)")
+                        && manager.contains("loadingPresentationGenerations")
+                        && manager.contains("presentationGenerationOwned(")
+                        && manager.contains("&& !isProjectionStillOwned(")
                         && manager.contains("repository.isGenerationCurrent(repositoryGeneration));"),
-                "exact Cave lifetime is still tied only to the short request lease");
+                "exact Cave lifetime lacks viewport or loading-generation ownership");
         require(regions.contains("CAVE_REGION_SUPERSEDED_PROJECTION_RETIRED")
                         && regions.contains("presentationRetired = true")
                         && regions.contains("if (request.presentationRetired)"),

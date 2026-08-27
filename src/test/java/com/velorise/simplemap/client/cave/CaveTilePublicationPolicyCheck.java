@@ -33,9 +33,13 @@ public final class CaveTilePublicationPolicyCheck {
                 MapRequestLane.MINIMAP, false, false, true, 1, now,
                 now + CaveTilePublicationPolicy.FIRST_MAX_HOLD_MS),
                 "leading minimap page deadline");
-        require(CaveTilePublicationPolicy.shouldPublish(
+        require(!CaveTilePublicationPolicy.shouldPublish(
                 MapRequestLane.MINIMAP, true, false, 1, now, now),
-                "minimap latency");
+                "initialized minimap single-tile coalescing");
+        require(CaveTilePublicationPolicy.shouldPublish(
+                MapRequestLane.MINIMAP, true, false, 1, now,
+                now + CaveTilePublicationPolicy.MAX_HOLD_MS),
+                "initialized minimap bounded latency");
         require(CaveTilePublicationPolicy.shouldPublish(
                 MapRequestLane.FULLSCREEN, true, true, 16, now, now),
                 "projection replacement");

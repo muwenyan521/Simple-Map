@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.cave.archive;
 
 import com.velorise.simplemap.client.cave.CaveChunkTile;
+import com.velorise.simplemap.client.cave.CaveCacheSchema;
 import com.velorise.simplemap.client.cave.CaveColumnData;
 
 import java.util.Arrays;
@@ -36,6 +37,15 @@ public final class CompactCaveTile {
     private final byte[] blockLight;
     private final byte[] skyLight;
     private final byte[] fluidDepth;
+    private final int[] fluidColors;
+    private final byte[] fluidAlpha;
+    private final short[] fluidY;
+    private final byte[] fluidLight;
+    private final byte[] fluidFlags;
+    private final int[] emissiveColors;
+    private final byte[] emissiveAlpha;
+    private final short[] emissiveY;
+    private final byte[] emissiveLight;
     private final byte[] flags;
     private final byte[] statuses;
     private final boolean completeCoverage;
@@ -53,6 +63,27 @@ public final class CompactCaveTile {
             int[] materialIds, short[] biomeIds, byte[] blockLight,
             byte[] skyLight, byte[] fluidDepth, byte[] flags,
             byte[] statuses) {
+        this(chunkX, chunkZ, revision, columnOffsets, runTopY, runFloorY,
+                materialIds, biomeIds, blockLight, skyLight, fluidDepth, flags,
+                new int[runTopY == null ? 0 : runTopY.length],
+                new byte[runTopY == null ? 0 : runTopY.length],
+                new short[runTopY == null ? 0 : runTopY.length],
+                new byte[runTopY == null ? 0 : runTopY.length],
+                new byte[runTopY == null ? 0 : runTopY.length],
+                new int[runTopY == null ? 0 : runTopY.length],
+                new byte[runTopY == null ? 0 : runTopY.length],
+                new short[runTopY == null ? 0 : runTopY.length],
+                new byte[runTopY == null ? 0 : runTopY.length], statuses);
+    }
+
+    public CompactCaveTile(int chunkX, int chunkZ, long revision,
+            int[] columnOffsets, short[] runTopY, short[] runFloorY,
+            int[] materialIds, short[] biomeIds, byte[] blockLight,
+            byte[] skyLight, byte[] fluidDepth, byte[] flags,
+            int[] fluidColors, byte[] fluidAlpha, short[] fluidY,
+            byte[] fluidLight, byte[] fluidFlags,
+            int[] emissiveColors, byte[] emissiveAlpha, short[] emissiveY,
+            byte[] emissiveLight, byte[] statuses) {
         if (columnOffsets == null || columnOffsets.length != COLUMNS + 1) {
             throw new IllegalArgumentException("columnOffsets");
         }
@@ -65,12 +96,21 @@ public final class CompactCaveTile {
                 || skyLight == null || skyLight.length != runs
                 || fluidDepth == null || fluidDepth.length != runs
                 || flags == null || flags.length != runs
+                || fluidColors == null || fluidColors.length != runs
+                || fluidAlpha == null || fluidAlpha.length != runs
+                || fluidY == null || fluidY.length != runs
+                || fluidLight == null || fluidLight.length != runs
+                || fluidFlags == null || fluidFlags.length != runs
+                || emissiveColors == null || emissiveColors.length != runs
+                || emissiveAlpha == null || emissiveAlpha.length != runs
+                || emissiveY == null || emissiveY.length != runs
+                || emissiveLight == null || emissiveLight.length != runs
                 || statuses == null || statuses.length != COLUMNS) {
             throw new IllegalArgumentException("compact cave arrays");
         }
         this.chunkX = chunkX;
         this.chunkZ = chunkZ;
-        this.revision = Math.max(1L, revision);
+        this.revision = CaveCacheSchema.canonicalContentRevision(revision);
         this.columnOffsets = Arrays.copyOf(columnOffsets, columnOffsets.length);
         this.runTopY = Arrays.copyOf(runTopY, runs);
         this.runFloorY = Arrays.copyOf(runFloorY, runs);
@@ -80,6 +120,15 @@ public final class CompactCaveTile {
         this.skyLight = Arrays.copyOf(skyLight, runs);
         this.fluidDepth = Arrays.copyOf(fluidDepth, runs);
         this.flags = Arrays.copyOf(flags, runs);
+        this.fluidColors = Arrays.copyOf(fluidColors, runs);
+        this.fluidAlpha = Arrays.copyOf(fluidAlpha, runs);
+        this.fluidY = Arrays.copyOf(fluidY, runs);
+        this.fluidLight = Arrays.copyOf(fluidLight, runs);
+        this.fluidFlags = Arrays.copyOf(fluidFlags, runs);
+        this.emissiveColors = Arrays.copyOf(emissiveColors, runs);
+        this.emissiveAlpha = Arrays.copyOf(emissiveAlpha, runs);
+        this.emissiveY = Arrays.copyOf(emissiveY, runs);
+        this.emissiveLight = Arrays.copyOf(emissiveLight, runs);
         this.statuses = Arrays.copyOf(statuses, COLUMNS);
         boolean complete = true;
         boolean fullProjectionComplete = true;
@@ -112,6 +161,15 @@ public final class CompactCaveTile {
     public byte skyLight(int run) { return skyLight[run]; }
     public byte fluidDepth(int run) { return fluidDepth[run]; }
     public byte flags(int run) { return flags[run]; }
+    public int fluidColor(int run) { return fluidColors[run]; }
+    public byte fluidAlpha(int run) { return fluidAlpha[run]; }
+    public short fluidY(int run) { return fluidY[run]; }
+    public byte fluidLight(int run) { return fluidLight[run]; }
+    public byte fluidFlags(int run) { return fluidFlags[run]; }
+    public int emissiveColor(int run) { return emissiveColors[run]; }
+    public byte emissiveAlpha(int run) { return emissiveAlpha[run]; }
+    public short emissiveY(int run) { return emissiveY[run]; }
+    public byte emissiveLight(int run) { return emissiveLight[run]; }
 
     /**
      * Selects one connected-looking Full Cave representative for a column.
@@ -255,7 +313,8 @@ public final class CompactCaveTile {
 
     public long estimatedBytes() {
         return (long) columnOffsets.length * Integer.BYTES
-                + (long) runTopY.length * (Short.BYTES * 3L + Integer.BYTES + 5L)
+                + (long) runTopY.length * (Short.BYTES * 5L
+                        + Integer.BYTES * 3L + 10L)
                 + statuses.length;
     }
 
@@ -272,6 +331,15 @@ public final class CompactCaveTile {
         for (byte value : skyLight) hash = mix(hash, value);
         for (byte value : fluidDepth) hash = mix(hash, value);
         for (byte value : flags) hash = mix(hash, value);
+        for (int value : fluidColors) hash = mix(hash, value);
+        for (byte value : fluidAlpha) hash = mix(hash, value);
+        for (short value : fluidY) hash = mix(hash, value);
+        for (byte value : fluidLight) hash = mix(hash, value);
+        for (byte value : fluidFlags) hash = mix(hash, value);
+        for (int value : emissiveColors) hash = mix(hash, value);
+        for (byte value : emissiveAlpha) hash = mix(hash, value);
+        for (short value : emissiveY) hash = mix(hash, value);
+        for (byte value : emissiveLight) hash = mix(hash, value);
         for (byte value : statuses) hash = mix(hash, value);
         hash ^= completeCoverage
                 ? 0x6C8E9CF570932BD5L : 0xA5A5A5A55A5A5A5AL;
@@ -307,6 +375,15 @@ public final class CompactCaveTile {
         byte[] sky = new byte[totalRuns];
         byte[] fluidDepth = new byte[totalRuns];
         byte[] flags = new byte[totalRuns];
+        int[] fluidColors = new int[totalRuns];
+        byte[] fluidAlpha = new byte[totalRuns];
+        short[] fluidY = new short[totalRuns];
+        byte[] fluidLight = new byte[totalRuns];
+        byte[] fluidFlags = new byte[totalRuns];
+        int[] emissiveColors = new int[totalRuns];
+        byte[] emissiveAlpha = new byte[totalRuns];
+        short[] emissiveY = new short[totalRuns];
+        byte[] emissiveLight = new byte[totalRuns];
         byte[] statuses = new byte[COLUMNS];
         int cursor = 0;
         BitSet scanned = snapshot.scanned();
@@ -332,11 +409,23 @@ public final class CompactCaveTile {
                 if ((old & CaveColumnData.FLAG_FLUID) != 0) legacyFlags |= FLAG_FLUID;
                 if ((old & CaveColumnData.FLAG_EMISSIVE) != 0) legacyFlags |= FLAG_EMISSIVE;
                 flags[cursor] = legacyFlags;
+                fluidColors[cursor] = data.fluidColor(run);
+                fluidAlpha[cursor] = data.fluidAlpha(run);
+                fluidY[cursor] = data.fluidY(run);
+                fluidLight[cursor] = data.fluidLight(run);
+                fluidDepth[cursor] = data.fluidDepth(run);
+                fluidFlags[cursor] = data.fluidFlags(run);
+                emissiveColors[cursor] = data.emissiveColor(run);
+                emissiveAlpha[cursor] = data.emissiveAlpha(run);
+                emissiveY[cursor] = data.emissiveY(run);
+                emissiveLight[cursor] = data.emissiveLight(run);
                 cursor++;
             }
         }
         return new CompactCaveTile(snapshot.chunkX(), snapshot.chunkZ(),
                 snapshot.revision(), offsets, top, floor, material, biome,
-                block, sky, fluidDepth, flags, statuses);
+                block, sky, fluidDepth, flags, fluidColors, fluidAlpha,
+                fluidY, fluidLight, fluidFlags, emissiveColors,
+                emissiveAlpha, emissiveY, emissiveLight, statuses);
     }
 }

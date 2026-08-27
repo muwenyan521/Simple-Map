@@ -24,7 +24,7 @@ public final class CavePass84ArchiveFastPathCheck {
                         && repository.contains("archived.fullProjectionCoverage()")
                         && repository.contains("indexedProjectionMask"),
                 "Full revision/resolution authority rejects mixed archive/absence pages");
-        require(style.contains("STYLE_SIGNATURE_VERSION = 19"),
+        require(style.contains("STYLE_SIGNATURE_VERSION = 20"),
                 "PASS86 incomplete Full CIMG cache is still valid");
         System.out.println("CAVE_PASS84_ARCHIVE_FAST_PATH_PASS");
     }

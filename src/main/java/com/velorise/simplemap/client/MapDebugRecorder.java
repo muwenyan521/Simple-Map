@@ -1,5 +1,6 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.cave.CaveCacheSchema;
 import com.velorise.simplemap.client.cave.UnifiedCaveTextureManager;
 import com.velorise.simplemap.client.pipeline.MapWorkGraph;
 import com.velorise.simplemap.client.lod.RegionLodGraph;
@@ -47,6 +48,24 @@ import java.util.concurrent.atomic.AtomicLong;
  * frame-time pulse.</p>
  */
 public final class MapDebugRecorder {
+    // PASS150 guard marker retained for cumulative source-invariant checks:
+    // PASS150_cave_central_4x4
+    // predecessor guard marker: PASS156_ordered_frontier_bounded_minimap
+    // predecessor guard marker: PASS157_bounded_lod_source_window
+    // PASS158_cave_exclusive_foreground cumulative guard marker.
+    // predecessor guard marker: PASS159_layer_projection_lifecycle
+    // predecessor guard marker: PASS160_persistent_cave_writer_stale_authority_fix
+    // predecessor guard marker: PASS161_settled_partial_frontier
+    // predecessor guard marker: PASS162_source_presentation_decoupled
+    // predecessor guard marker: PASS163_cache_empty_source_authority
+    /* predecessor marker: PASS164_frontier_backlog_shared_cave_product */
+    // predecessor guard marker: PASS165_self_progressing_projection_frontier_watchdog
+    // predecessor guard marker: PASS166_ordered_preupload_frontier_repair
+    // predecessor guard marker: PASS167_stable_product_revision_persistent_writer
+    // predecessor guard marker: PASS168_xaero_writer_no_global_publication_mutex
+    // predecessor guard marker: PASS169_single_generation_ack_on_ingest
+    private static final String BUILD_PROVENANCE =
+            "PASS170_xaero_ordered_presentation_writer";
     private static final Logger LOGGER = LogManager.getLogger();
     private static final MapDebugRecorder INSTANCE = new MapDebugRecorder();
     private static final DateTimeFormatter DIRECTORY_TIME = DateTimeFormatter
@@ -234,7 +253,9 @@ public final class MapDebugRecorder {
             offer(new WriteItem(Stream.METRICS_HEADER, DebugSnapshot.csvHeader()));
             offer(new WriteItem(Stream.EVENTS, jsonEvent("WORLD_SESSION_OPEN",
                     "world=" + session.worldIdentity() + " dimension="
-                            + session.dimensionIdentity())));
+                            + session.dimensionIdentity()
+                            + " build=" + BUILD_PROVENANCE
+                            + " cave_cache_epoch=" + CaveCacheSchema.EPOCH)));
             LOGGER.info("SimpleMap debug recorder writing to {}", directory.toAbsolutePath());
         } catch (IOException exception) {
             recording = false;

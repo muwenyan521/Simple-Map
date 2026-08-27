@@ -1,10 +1,12 @@
 package com.velorise.simplemap.client.cave.archive;
 
+import com.velorise.simplemap.client.MapDebugRecorder;
 import com.velorise.simplemap.client.cave.CaveChunkTile;
 
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -26,7 +28,10 @@ public final class CaveArchiveV2Service {
     private static final CaveArchiveV2Service INSTANCE =
             new CaveArchiveV2Service();
     private static final int MAX_RESIDENT_TILES = 32768;
-    private static final long MAX_RESIDENT_BYTES = 192L * 1024L * 1024L;
+    private static final long MIB = 1024L * 1024L;
+    private static final long MIN_RESIDENT_BYTES = 64L * MIB;
+    private static final long MAX_RESIDENT_BYTES =
+            calculateResidentByteLimit();
     /** Metadata-only inactive partitions are cheap; bound pathological modpacks. */
     private static final int MAX_DIMENSION_PARTITIONS = 8;
     private static final String UNKNOWN_DIMENSION = "simplemap:unknown";
@@ -39,6 +44,10 @@ public final class CaveArchiveV2Service {
         final Map<Long, Long> indexedFingerprints = new HashMap<>();
         final Set<Long> indexedCompleteChunks = new HashSet<>();
         final Set<Long> indexedFullProjectionChunks = new HashSet<>();
+        /** Persisted complete zero-run tiles are visual hints, not strong empty proof. */
+        final Set<Long> persistedUnverifiedEmptyChunks = new HashSet<>();
+        /** Content fingerprints verified against LIVE/WORLD_SAVE in this session. */
+        final Map<Long, Long> currentSessionVerifiedFingerprints = new HashMap<>();
         long bytes;
         long ingested;
         long replaced;
@@ -56,6 +65,8 @@ public final class CaveArchiveV2Service {
             indexedFingerprints.clear();
             indexedCompleteChunks.clear();
             indexedFullProjectionChunks.clear();
+            persistedUnverifiedEmptyChunks.clear();
+            currentSessionVerifiedFingerprints.clear();
             ingested = 0L;
             replaced = 0L;
             staleIgnored = 0L;
@@ -67,6 +78,21 @@ public final class CaveArchiveV2Service {
             new LinkedHashMap<>(8, 0.75f, true);
     private String activeDimension = UNKNOWN_DIMENSION;
     private Partition activePartition;
+
+    private static long calculateResidentByteLimit() {
+        /*
+         * PASS139: a fixed 192 MiB old-generation archive is too aggressive on a
+         * 4 GiB client heap. The supplied run reached ~3.1/4.0 GiB used while the
+         * archive alone held ~178 MiB, increasing full-GC scan pressure exactly
+         * when cold Cave streaming was allocating heavily. Keep a useful retained
+         * LRU, but scale it with heap and leave the persistent archive as the
+         * durable source of truth.
+         */
+        long heap = Math.max(512L * MIB,
+                Runtime.getRuntime().maxMemory());
+        return Math.max(MIN_RESIDENT_BYTES,
+                Math.min(160L * MIB, heap / 32L));
+    }
 
     private CaveArchiveV2Service() {
         activePartition = new Partition();
@@ -100,7 +126,7 @@ public final class CaveArchiveV2Service {
     public synchronized boolean ingest(CaveChunkTile.Snapshot snapshot) {
         CompactCaveTile compact = CompactCaveTile.fromLegacy(snapshot);
         if (compact == null) return false;
-        return ingestCompact(activePartition, compact);
+        return ingestCompact(activePartition, compact, true);
     }
 
     public synchronized CompactCaveTile get(int chunkX, int chunkZ) {
@@ -128,19 +154,58 @@ public final class CaveArchiveV2Service {
     }
 
     public synchronized boolean hasCompleteChunk(int chunkX, int chunkZ) {
-        CompactCaveTile tile = activePartition.tiles.get(pack(chunkX, chunkZ));
-        return tile != null && tile.completeCoverage();
+        long key = pack(chunkX, chunkZ);
+        CompactCaveTile tile = activePartition.tiles.get(key);
+        return tile != null && tile.completeCoverage()
+                && isProjectionTrusted(activePartition, key);
     }
 
     public synchronized boolean hasFullProjectionChunk(int chunkX, int chunkZ) {
-        CompactCaveTile tile = activePartition.tiles.get(pack(chunkX, chunkZ));
-        return tile != null && tile.fullProjectionCoverage();
+        long key = pack(chunkX, chunkZ);
+        CompactCaveTile tile = activePartition.tiles.get(key);
+        return tile != null && tile.fullProjectionCoverage()
+                && isProjectionTrusted(activePartition, key);
+    }
+
+    /**
+     * True when a resident persisted all-empty tile still needs one authoritative
+     * LIVE/WORLD_SAVE read in this session before it may close a visible hole.
+     */
+    public synchronized boolean requiresCurrentSourceVerification(int chunkX, int chunkZ) {
+        return activePartition.persistedUnverifiedEmptyChunks.contains(
+                pack(chunkX, chunkZ));
+    }
+
+    /** Strong-empty proof may only use source verified under the current Cave epoch. */
+    public synchronized boolean isStrongEmptyProofTrusted(int chunkX, int chunkZ) {
+        long key = pack(chunkX, chunkZ);
+        return activePartition.tiles.containsKey(key)
+                && isProjectionTrusted(activePartition, key);
     }
 
     /** Used by persistence replay without rebuilding a legacy snapshot. */
     public synchronized boolean ingest(CompactCaveTile compact) {
         if (compact == null) return false;
-        return ingestCompact(activePartition, compact);
+        return ingestCompact(activePartition, compact, true);
+    }
+
+    /**
+     * Publishes one persisted native-region snapshot under a single archive lock.
+     * Readers therefore observe either the old resident set or the complete refill,
+     * never hundreds of intermediate page fingerprints while one SMR2 file is being
+     * replayed. This mirrors Xaero's region-cache handoff.
+     */
+    public synchronized int ingestBatch(List<CompactCaveTile> compactTiles) {
+        if (compactTiles == null || compactTiles.isEmpty()) return 0;
+        Partition partition = activePartition;
+        int accepted = 0;
+        for (CompactCaveTile compact : compactTiles) {
+            if (compact == null) continue;
+            ingestCompactWithoutTrim(partition, compact, false);
+            accepted++;
+        }
+        trim(partition);
+        return accepted;
     }
 
     /** 16-bit central-page resident coverage, ordered localX * 4 + localZ. */
@@ -154,9 +219,11 @@ public final class CaveArchiveV2Service {
             for (int localX = 0; localX < 4; localX++) {
                 CompactCaveTile tile = partition.tiles.get(pack(
                         firstChunkX + localX, firstChunkZ + localZ));
+                long key = pack(firstChunkX + localX, firstChunkZ + localZ);
                 boolean covered = tile != null && (fullProjection
                         ? tile.fullProjectionCoverage()
-                        : tile.completeCoverage());
+                        : tile.completeCoverage())
+                        && isProjectionTrusted(partition, key);
                 if (covered) mask |= 1 << (localX * 4 + localZ);
             }
         }
@@ -205,6 +272,7 @@ public final class CaveArchiveV2Service {
         long contentFingerprint = compact.contentFingerprint();
         long previousFingerprint = partition.indexedFingerprints.getOrDefault(
                 key, Long.MIN_VALUE);
+        updateVerificationState(partition, key, compact, false);
         if (previousFingerprint == contentFingerprint) return false;
 
         long previousContribution = partition.indexedContributions.getOrDefault(key, 0L);
@@ -229,8 +297,8 @@ public final class CaveArchiveV2Service {
         int mask = 0;
         for (int localZ = 0; localZ < 4; localZ++) {
             for (int localX = 0; localX < 4; localX++) {
-                if (coverage.contains(pack(firstChunkX + localX,
-                        firstChunkZ + localZ))) {
+                long key = pack(firstChunkX + localX, firstChunkZ + localZ);
+                if (coverage.contains(key) && isProjectionTrusted(partition, key)) {
                     mask |= 1 << (localX * 4 + localZ);
                 }
             }
@@ -248,12 +316,16 @@ public final class CaveArchiveV2Service {
     }
 
     public synchronized boolean hasIndexedCompleteChunk(int chunkX, int chunkZ) {
-        return activePartition.indexedCompleteChunks.contains(pack(chunkX, chunkZ));
+        long key = pack(chunkX, chunkZ);
+        return activePartition.indexedCompleteChunks.contains(key)
+                && isProjectionTrusted(activePartition, key);
     }
 
     public synchronized boolean hasIndexedFullProjectionChunk(int chunkX,
             int chunkZ) {
-        return activePartition.indexedFullProjectionChunks.contains(pack(chunkX, chunkZ));
+        long key = pack(chunkX, chunkZ);
+        return activePartition.indexedFullProjectionChunks.contains(key)
+                && isProjectionTrusted(activePartition, key);
     }
 
     public synchronized boolean hasIndexedCompletePage(int globalPageX,
@@ -266,9 +338,41 @@ public final class CaveArchiveV2Service {
         return indexedProjectionMask(globalPageX, globalPageZ, true) == 0xFFFF;
     }
 
-    private boolean ingestCompact(Partition partition, CompactCaveTile compact) {
+    private boolean ingestCompact(Partition partition, CompactCaveTile compact,
+            boolean verifiedCurrentSource) {
+        boolean changed = ingestCompactWithoutTrim(partition, compact,
+                verifiedCurrentSource);
+        trim(partition);
+        return changed;
+    }
+
+    private boolean ingestCompactWithoutTrim(Partition partition,
+            CompactCaveTile compact, boolean verifiedCurrentSource) {
         long key = pack(compact.chunkX(), compact.chunkZ());
         long contentFingerprint = compact.contentFingerprint();
+        if (!verifiedCurrentSource) {
+            Long verifiedFingerprint =
+                    partition.currentSessionVerifiedFingerprints.get(key);
+            if (verifiedFingerprint != null
+                    && verifiedFingerprint.longValue() != contentFingerprint) {
+                partition.staleIgnored++;
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                String eventKey = "CAVE_PERSISTED_ARCHIVE_STALE_AGAINST_CURRENT:"
+                        + compact.chunkX() + ':' + compact.chunkZ();
+                if (recorder.shouldEmitEvent(eventKey, 2_000L)) {
+                    recorder.event("CAVE_PERSISTED_ARCHIVE_STALE_AGAINST_CURRENT",
+                            "chunk=" + compact.chunkX() + ',' + compact.chunkZ()
+                                    + " persisted_fingerprint="
+                                    + Long.toUnsignedString(contentFingerprint, 16)
+                                    + " current_fingerprint="
+                                    + Long.toUnsignedString(verifiedFingerprint, 16)
+                                    + " action=ignore_persisted_replay"
+                                    + " pass=PASS154");
+                }
+                return false;
+            }
+        }
+        updateVerificationState(partition, key, compact, verifiedCurrentSource);
         long indexedFingerprint = partition.indexedFingerprints.getOrDefault(
                 key, Long.MIN_VALUE);
         if (indexedFingerprint == contentFingerprint) {
@@ -277,7 +381,6 @@ public final class CaveArchiveV2Service {
             if (resident == null) {
                 partition.tiles.put(key, compact);
                 partition.bytes += compact.estimatedBytes();
-                trim(partition);
             }
             return false;
         }
@@ -301,8 +404,66 @@ public final class CaveArchiveV2Service {
         partition.tiles.put(key, compact);
         partition.bytes += compact.estimatedBytes();
         partition.ingested++;
-        trim(partition);
         return true;
+    }
+
+    private static boolean isProjectionTrusted(Partition partition, long key) {
+        return !partition.persistedUnverifiedEmptyChunks.contains(key);
+    }
+
+    private static boolean persistedEmptyCandidate(CompactCaveTile compact) {
+        return compact != null && compact.runCount() == 0
+                && compact.fullProjectionCoverage();
+    }
+
+    /**
+     * Persistence is a cache, not source authority. A zero-run tile replayed from
+     * SMR2 cannot prove that an entire 16x16 chunk is truly cave-empty until the
+     * current world source confirms the same content fingerprint once this session.
+     * This specifically prevents historical false-empty cache entries from becoming
+     * permanent 64x64 black holes across reload, Top-Y changes and Full Cave.
+     */
+    private static void updateVerificationState(Partition partition, long key,
+            CompactCaveTile compact, boolean verifiedCurrentSource) {
+        long fingerprint = compact.contentFingerprint();
+        boolean wasUnverified = partition.persistedUnverifiedEmptyChunks.contains(key);
+        if (verifiedCurrentSource) {
+            partition.currentSessionVerifiedFingerprints.put(key, fingerprint);
+            partition.persistedUnverifiedEmptyChunks.remove(key);
+            if (wasUnverified) {
+                MapDebugRecorder.getInstance().event(
+                        compact.runCount() == 0
+                                ? "CAVE_PERSISTED_EMPTY_REVERIFIED"
+                                : "CAVE_PERSISTED_EMPTY_CORRECTED",
+                        "chunk=" + compact.chunkX() + ',' + compact.chunkZ()
+                                + " runs=" + compact.runCount()
+                                + " fingerprint=" + Long.toUnsignedString(fingerprint, 16)
+                                + " policy=current_world_source_closes_persisted_empty_proof"
+                                + " pass=PASS154");
+            }
+            return;
+        }
+
+        Long verifiedFingerprint = partition.currentSessionVerifiedFingerprints.get(key);
+        boolean alreadyVerified = verifiedFingerprint != null
+                && verifiedFingerprint.longValue() == fingerprint;
+        if (persistedEmptyCandidate(compact) && !alreadyVerified) {
+            if (partition.persistedUnverifiedEmptyChunks.add(key)) {
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                String eventKey = "CAVE_PERSISTED_EMPTY_REVERIFY_REQUIRED:"
+                        + compact.chunkX() + ':' + compact.chunkZ();
+                if (recorder.shouldEmitEvent(eventKey, 2_000L)) {
+                    recorder.event("CAVE_PERSISTED_EMPTY_REVERIFY_REQUIRED",
+                            "chunk=" + compact.chunkX() + ',' + compact.chunkZ()
+                                    + " fingerprint="
+                                    + Long.toUnsignedString(fingerprint, 16)
+                                    + " policy=persisted_zero_run_is_not_strong_empty_authority"
+                                    + " pass=PASS154");
+                }
+            }
+        } else {
+            partition.persistedUnverifiedEmptyChunks.remove(key);
+        }
     }
 
     public synchronized Summary summary() {

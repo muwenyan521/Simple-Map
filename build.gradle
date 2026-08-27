@@ -345,3 +345,81 @@ tasks.register('cavePass81DemandLifecycleCheck', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.velorise.simplemap.client.cave.CavePass81DemandLifecycleCheck'
 }
+
+// PASS131: admitted Cave source outlives viewport pulses, loading generations own
+// completed projection handoff, and writer expansion is guarded by last-good tiles.
+tasks.register('cavePass131LifecycleInvariantCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass131LifecycleInvariantCheck'
+}
+
+// PASS132: disk absence is transient, LIVE revokes weaker retained authority,
+// and only proof-bearing complete emptiness may enter presentation/CIMG.
+tasks.register('cavePass132AuthorityInvariantCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass132AuthorityInvariantCheck'
+}
+
+// PASS133-A-D: canonical scanning is hard-sliced, transient acquisition can
+// quiesce without Cave authority, and archive/page revisions publish by milestone.
+tasks.register('cavePass133PerformanceInvariantCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass133PerformanceInvariantCheck'
+}
+
+// PASS134: live disk-absence repair is deduped and budget-owned, native imports
+// route by chunk without retry churn, and all archive writers compose lava once.
+tasks.register('cavePass134PostAuthorityPerformanceCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass134PostAuthorityPerformanceCheck'
+}
+
+// PASS134-A/B/D/E: exact Layered products retain independent Top-Y identity,
+// content builds survive presentation turnover, presence wakes stay local, and
+// compact archive arrays are materialized off the client lane.
+tasks.register('cavePass135BottleneckIdentityCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass135BottleneckIdentityCheck'
+}
+
+// PASS136-A/B: world-save presence is one bounded async Anvil-region snapshot,
+// while exact Layered retention trims only the target chunk's tiny key bucket.
+tasks.register('cavePass136LocalityInvariantCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass136LocalityInvariantCheck'
+}
+
+// PASS137-A/B: repeated viewport observations retain one idempotent source
+// frontier, and visible admission closes focus/near-complete pages before halo.
+tasks.register('cavePass137SourceFrontierCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CavePass137SourceFrontierCheck'
+}
+
+tasks.register('caveArchiveFrontierEmissiveCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath + sourceSets.main.compileClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveArchiveFrontierEmissiveCheck'
+}
+
+tasks.register('caveRegionImageCacheCheck', JavaExec) {
+    group = 'verification'
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.velorise.simplemap.client.cave.CaveRegionImageCacheCheck'
+}

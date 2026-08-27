@@ -31,7 +31,7 @@ final class MapRenderPlan {
     static final int PHASE_REGION_COARSE = 4;
     static final int PHASE_BRANCH_BASE = 16;
     /** Exact fallback drawn immediately below the density-correct L1 branch. */
-    static final int PHASE_L1_EXACT_UNDERLAY = 19;
+    static final int PHASE_L1_EXACT_UNDERLAY = 27;
     static final int PHASE_EXACT = 96;
     static final int PHASE_GLOW = 128;
 

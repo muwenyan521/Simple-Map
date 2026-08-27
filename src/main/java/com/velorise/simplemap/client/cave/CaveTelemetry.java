@@ -1,5 +1,7 @@
 package com.velorise.simplemap.client.cave;
 
+import com.velorise.simplemap.client.MapPipelineStage;
+import com.velorise.simplemap.client.MapPipelineTelemetry;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -18,6 +20,14 @@ public final class CaveTelemetry {
     private final AtomicLong revalidatedColumns = new AtomicLong();
     private final AtomicLong changedRevalidations = new AtomicLong();
     private final AtomicLong scanNanos = new AtomicLong();
+    private final AtomicLong archiveScanSlices = new AtomicLong();
+    private final AtomicLong archiveScanSliceNanos = new AtomicLong();
+    private final AtomicLong archiveScanSliceMaxNanos = new AtomicLong();
+    private final AtomicLong archiveScanVerticalSteps = new AtomicLong();
+    private final AtomicLong archiveScanPauses = new AtomicLong();
+    private final AtomicLong archiveInternalColumnCommits = new AtomicLong();
+    private final AtomicLong archiveCompactPublications = new AtomicLong();
+    private final AtomicLong archivePageFingerprintChanges = new AtomicLong();
     private final AtomicLong blockStateReads = new AtomicLong();
     private final AtomicLong airSectionSkips = new AtomicLong();
     private final AtomicLong solidSectionSkips = new AtomicLong();
@@ -68,6 +78,30 @@ public final class CaveTelemetry {
     }
 
     public void recordBlockStateRead() { if (COLLECT_ENABLED) blockStateReads.incrementAndGet(); }
+
+    public void recordArchiveScanSlice(long nanos, int steps, boolean paused) {
+        long safeNanos = Math.max(0L, nanos);
+        // The main debug recorder always captures stage avg/max/count, independent
+        // from the optional verbose cave telemetry system property.
+        MapPipelineTelemetry.getInstance().recordStageNanos(
+                MapPipelineStage.CAVE_ARCHIVE_SCAN, safeNanos);
+        if (!COLLECT_ENABLED) return;
+        archiveScanSlices.incrementAndGet();
+        archiveScanSliceNanos.addAndGet(safeNanos);
+        archiveScanSliceMaxNanos.accumulateAndGet(safeNanos, Math::max);
+        archiveScanVerticalSteps.addAndGet(Math.max(0, steps));
+        if (paused) archiveScanPauses.incrementAndGet();
+    }
+
+    public void recordInternalArchiveColumnCommit() {
+        if (COLLECT_ENABLED) archiveInternalColumnCommits.incrementAndGet();
+    }
+
+    public void recordArchiveCompactPublication(boolean pageFingerprintChanged) {
+        if (!COLLECT_ENABLED) return;
+        archiveCompactPublications.incrementAndGet();
+        if (pageFingerprintChanged) archivePageFingerprintChanges.incrementAndGet();
+    }
     public void recordAirSectionSkip() { if (COLLECT_ENABLED) airSectionSkips.incrementAndGet(); }
     public void recordSolidSectionSkip() { if (COLLECT_ENABLED) solidSectionSkips.incrementAndGet(); }
     public void recordStateCacheHits(long count) { if (COLLECT_ENABLED) stateCacheHits.addAndGet(Math.max(0L, count)); }
@@ -117,7 +151,12 @@ public final class CaveTelemetry {
 
     public Snapshot snapshot() {
         return new Snapshot(scannedColumns.get(), revalidatedColumns.get(),
-                changedRevalidations.get(), scanNanos.get(), blockStateReads.get(),
+                changedRevalidations.get(), scanNanos.get(),
+                archiveScanSlices.get(), archiveScanSliceNanos.get(),
+                archiveScanSliceMaxNanos.get(), archiveScanVerticalSteps.get(),
+                archiveScanPauses.get(), archiveInternalColumnCommits.get(),
+                archiveCompactPublications.get(),
+                archivePageFingerprintChanges.get(), blockStateReads.get(),
                 airSectionSkips.get(), solidSectionSkips.get(), stateCacheHits.get(),
                 stateCacheMisses.get(), stateDynamicFallbacks.get(), graphNanos.get(),
                 resolvedPages.get(), resolvedPageCacheHits.get(),
@@ -161,7 +200,12 @@ public final class CaveTelemetry {
     }
 
     public record Snapshot(long scannedColumns, long revalidatedColumns,
-            long changedRevalidations, long scanNanos, long blockStateReads,
+            long changedRevalidations, long scanNanos,
+            long archiveScanSlices, long archiveScanSliceNanos,
+            long archiveScanSliceMaxNanos, long archiveScanVerticalSteps,
+            long archiveScanPauses, long archiveInternalColumnCommits,
+            long archiveCompactPublications, long archivePageFingerprintChanges,
+            long blockStateReads,
             long airSectionSkips, long solidSectionSkips, long stateCacheHits,
             long stateCacheMisses, long stateDynamicFallbacks, long graphNanos,
             long resolvedPages, long resolvedPageCacheHits,

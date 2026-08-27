@@ -54,9 +54,9 @@ public final class CaveScreenSpacePolicy {
     public static int exactAdmissionBudget(float scale, MapRequestLane lane,
             boolean pressured) {
         int normal;
-        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 8 : 32;
+        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 2 : 4;
         else if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) normal = 1;
-        else if (branchOnly(scale, lane)) normal = pressured ? 4 : 16;
+        else if (branchOnly(scale, lane)) normal = pressured ? 2 : 8;
         else if (pressured) normal = 4;
         else if (scale >= 0.55f) normal = 40;
         else if (scale >= 0.35f) normal = 32;
@@ -67,7 +67,7 @@ public final class CaveScreenSpacePolicy {
 
     /** Delay expensive exact refinement while branch/root coverage is foreground. */
     public static long exactEnumerationRetryMs(float scale, MapRequestLane lane) {
-        if (lane == MapRequestLane.MINIMAP) return 16L;
+        if (lane == MapRequestLane.MINIMAP) return 32L;
         if (branchFirst(scale, lane)) return 24L;
         if (sparseExact(scale, lane)) return 32L;
         if (scale < 0.35f) return 24L;
@@ -90,9 +90,9 @@ public final class CaveScreenSpacePolicy {
     public static int sourceAdmissionBudget(float scale, MapRequestLane lane,
             boolean pressured) {
         int normal;
-        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 6 : 20;
+        if (lane == MapRequestLane.MINIMAP) normal = pressured ? 2 : 6;
         else if (lane == MapRequestLane.BACKGROUND || lane == MapRequestLane.PREFETCH) normal = 1;
-        else if (branchOnly(scale, lane)) normal = pressured ? 12 : 48;
+        else if (branchOnly(scale, lane)) normal = pressured ? 2 : 8;
         else if (pressured) normal = 4;
         else if (scale >= 0.55f) normal = 24;
         else if (scale >= 0.35f) normal = 20;
@@ -104,14 +104,14 @@ public final class CaveScreenSpacePolicy {
     public static long sourceEnumerationRetryMs(float scale, MapRequestLane lane,
             boolean pressured) {
         if (lane == MapRequestLane.MINIMAP) return pressured ? 40L : 16L;
-        if (branchFirst(scale, lane)) return pressured ? 64L : 20L;
+        if (branchFirst(scale, lane)) return pressured ? 120L : 64L;
         if (sparseExact(scale, lane)) return pressured ? 80L : 32L;
         return pressured ? 70L : 20L;
     }
 
     public static long completedSourcePlanPauseMs(float scale,
             MapRequestLane lane, boolean pressured) {
-        if (branchFirst(scale, lane)) return pressured ? 160L : 48L;
+        if (branchFirst(scale, lane)) return pressured ? 240L : 96L;
         if (sparseExact(scale, lane)) return pressured ? 240L : 72L;
         return pressured ? 260L : 48L;
     }

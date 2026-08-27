@@ -1,6 +1,8 @@
 package com.velorise.simplemap.client.cave;
 
 import com.velorise.simplemap.client.CaveMode;
+import com.velorise.simplemap.client.GeneratedChunkIndex;
+import com.velorise.simplemap.client.MapDebugRecorder;
 import com.velorise.simplemap.client.MapConfig;
 import com.velorise.simplemap.client.MapManager;
 import com.velorise.simplemap.client.MapVisualClassifier;
@@ -10,6 +12,8 @@ import com.velorise.simplemap.client.MapMutationBus;
 import com.velorise.simplemap.client.MapViewportDemandPolicy;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.level.Level;
+import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import java.io.File;
 
@@ -36,6 +40,8 @@ public final class CavePipeline {
             new CaveDisplayScheduler(repository, readiness);
     private final CaveWorldSaveReader worldSaveReader = CaveWorldSaveReader.getInstance();
     private final CaveTelemetry telemetry = CaveTelemetry.getInstance();
+    /** Cross-thread callbacks only append primitive keys; client work stays budgeted. */
+    private final LiveRepairInbox liveRepairInbox = new LiveRepairInbox();
 
     private static final int MAX_VISIBLE_SOFT_REFRESH_TILES = 4096;
     private static final int MAX_TRANSITION_STALE_TILES = 4096;
@@ -80,6 +86,11 @@ public final class CavePipeline {
         displayScheduler.enqueueLoadedChunk(chunkX, chunkZ);
     }
 
+    /** Callback path: no Minecraft execute(), world access, invalidation or fanout. */
+    void repairTransientDiskAbsence(int chunkX, int chunkZ) {
+        liveRepairInbox.offer(CaveTileRepository.pack(chunkX, chunkZ));
+    }
+
     public CaveTelemetry.Snapshot telemetry() {
         return telemetry.snapshot();
     }
@@ -97,6 +108,7 @@ public final class CavePipeline {
         CaveRegionImageCache.getInstance().setBaseDirectory(directory);
         scheduler.reset();
         displayScheduler.reset();
+        liveRepairInbox.clear();
         readiness.reset();
         worldSaveReader.reset();
         worldSaveReader.clearSourceCache();
@@ -285,9 +297,23 @@ public final class CavePipeline {
                 centerChunkX, centerChunkZ, 1_000_000,
                 MapRequestLane.MINIMAP);
 
+        // Keep a bounded canonical archive writer hot around the player. Display
+        // pixels alone cannot repair a stale/missing style-independent archive.
+        scheduler.enqueueAround(minecraft.level, centerChunkX, centerChunkZ,
+                1, 1_100_000, CaveTileScheduler.Lane.FOREGROUND);
+
         long budget = MapPerformanceGovernor.getInstance().gameplayScanBudgetNanos(true);
         if (budget > 0L) {
-            displayScheduler.process(minecraft.level, System.nanoTime() + budget);
+            long started = System.nanoTime();
+            long deadline = started + budget;
+            drainLiveRepairInbox(minecraft,
+                    started + Math.min(80_000L, budget / 10L), 16);
+            repository.pumpArchivePublications(1);
+            displayScheduler.process(minecraft.level,
+                    started + Math.max(1L, budget * 4L / 5L));
+            if (System.nanoTime() < deadline) {
+                scheduler.process(minecraft.level, deadline);
+            }
         }
         updateTelemetry();
     }
@@ -311,8 +337,21 @@ public final class CavePipeline {
         // by scanAroundPlayer/scanVisibleArea. Replacing it every render frame with
         // a 7x7 hot window reset the rolling cursor before outer loaded chunks were
         // ever revisited. This path only resumes already-admitted work.
-        displayScheduler.process(minecraft.level,
-                System.nanoTime() + CaveModeTransitionPolicy.foregroundBudget(budgetNanos));
+        long governed = CaveModeTransitionPolicy.foregroundBudget(budgetNanos);
+        if (governed <= 0L) return;
+        long started = System.nanoTime();
+        long finalDeadline = started + governed;
+        long repairSlice = Math.min(80_000L, governed / 8L);
+        long archiveSlice = Math.min(120_000L, governed / 5L);
+        if (repairSlice > 0L) {
+            drainLiveRepairInbox(minecraft, started + repairSlice, 16);
+        }
+        repository.pumpArchivePublications(1);
+        long displayDeadline = Math.max(started, finalDeadline - archiveSlice);
+        displayScheduler.process(minecraft.level, displayDeadline);
+        if (archiveSlice > 0L && System.nanoTime() < finalDeadline) {
+            scheduler.process(minecraft.level, finalDeadline);
+        }
         updateTelemetry();
     }
 
@@ -427,6 +466,32 @@ public final class CavePipeline {
                     viewportMinChunkX, viewportMaxChunkX,
                     viewportMinChunkZ, viewportMaxChunkZ,
                     viewportCenterX, viewportCenterZ, scale, effectiveLane);
+        }
+
+        /*
+         * PASS148: fullscreen Cave is a stable world-save snapshot transaction.
+         * Do not also advance the mutable live-column writer while the same viewport
+         * is being reconstructed from Anvil. The 14:07 trace showed exactly why:
+         * CAVE_RESULT_STALE=893 while only CAVE_PAGE_GPU_READY=208, with individual
+         * pages rebuilding 10-20 times as live archive milestones changed the source
+         * fingerprint. Xaero's WorldDataReader builds a MapTileChunk from one saved
+         * snapshot and promotes it once; live writer updates are a later concern.
+         *
+         * The minimap/gameplay lane still owns the live writer when MapScreen is not
+         * the current Cave consumer. When fullscreen closes, that lane resumes and
+         * can refine any world changes made after the snapshot.
+         */
+        if (effectiveLane == MapRequestLane.FULLSCREEN) {
+            MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+            if (recorder.shouldEmitEvent("CAVE_FULLSCREEN_SAVED_SOURCE_ONLY", 500L)) {
+                recorder.event("CAVE_FULLSCREEN_SAVED_SOURCE_ONLY",
+                        "view=" + view + " top_y=" + layerY
+                                + " chunks=" + (viewportMaxChunkX - viewportMinChunkX + 1)
+                                + 'x' + (viewportMaxChunkZ - viewportMinChunkZ + 1)
+                                + " policy=anvil_snapshot_no_live_writer");
+            }
+            updateTelemetry();
+            return;
         }
 
         int playerChunkX = ((int) Math.floor(minecraft.player.getX())) >> 4;
@@ -589,6 +654,12 @@ public final class CavePipeline {
     /** Chunk unload revokes authority but deliberately preserves cached pixels. */
     public void onChunkUnavailable(int chunkX, int chunkZ, int reasons) {
         readiness.markChunkChanged(chunkX, chunkZ);
+        long packed = CaveTileRepository.pack(chunkX, chunkZ);
+        liveRepairInbox.cancel(packed);
+        CaveChunkTile tile = repository.getLoadedTile(chunkX, chunkZ);
+        if (tile != null) tile.markLiveUnavailable();
+        CaveNativeRegionImportService.getInstance()
+                .resumeDiskAfterLiveUnavailable(chunkX, chunkZ);
         // Unload revokes LIVE authority, not saved/archive correctness. Keep the
         // last-good display page authoritative so a render-distance edge does not
         // trigger an Anvil reread loop while the player stands or turns around.
@@ -801,6 +872,7 @@ public final class CavePipeline {
     public void clearRuntime(boolean preserveDisk) {
         scheduler.reset();
         displayScheduler.reset();
+        liveRepairInbox.clear();
         readiness.reset();
         worldSaveReader.reset();
         worldSaveReader.clearSourceCache();
@@ -817,6 +889,7 @@ public final class CavePipeline {
     public void flushForDimensionSwitch() {
         scheduler.reset();
         displayScheduler.reset();
+        liveRepairInbox.clear();
         readiness.reset();
         worldSaveReader.reset();
         worldSaveReader.clearSourceCache();
@@ -831,6 +904,7 @@ public final class CavePipeline {
     public void flushAndClear() {
         scheduler.reset();
         displayScheduler.reset();
+        liveRepairInbox.clear();
         readiness.reset();
         worldSaveReader.reset();
         layerWarmup = null;
@@ -883,6 +957,47 @@ public final class CavePipeline {
         if (queued) scheduler.enqueueRevalidation(chunkX, chunkZ, 650_000);
     }
 
+    /** Drains live authority transitions only on a governed client-thread lane. */
+    private int drainLiveRepairInbox(Minecraft minecraft, long deadlineNanos,
+            int maximum) {
+        int repaired = 0;
+        while (repaired < maximum && System.nanoTime() < deadlineNanos) {
+            long packed = liveRepairInbox.poll();
+            if (packed == LiveRepairInbox.NONE) break;
+            int chunkX = (int) (packed >> 32);
+            int chunkZ = (int) packed;
+            if (!usable(minecraft) || !minecraft.level.hasChunk(chunkX, chunkZ)) {
+                CaveNativeRegionImportService.getInstance()
+                        .resumeDiskAfterLiveUnavailable(chunkX, chunkZ);
+                continue;
+            }
+
+            GeneratedChunkIndex.getInstance().markLive(
+                    minecraft.level, chunkX, chunkZ);
+            CaveTileRepository.LiveAuthorityClaim claim =
+                    repository.ensureLiveAuthority(chunkX, chunkZ);
+            int routedCells = CaveNativeRegionImportService.getInstance()
+                    .markLivePending(chunkX, chunkZ);
+            if (claim.state() == CaveChunkTile.LiveAuthorityState.LIVE_COMPLETE) {
+                CaveNativeRegionImportService.getInstance()
+                        .acknowledgeLiveArchive(chunkX, chunkZ);
+            } else if (claim.transitioned() && claim.tile().needsScanWork()) {
+                scheduler.enqueue(chunkX, chunkZ, 1_900_000);
+            }
+            if (claim.transitioned() || routedCells > 0) {
+                MapDebugRecorder.getInstance().event(
+                        "CAVE_LIVE_REVOKED_DISK_ABSENCE",
+                        "chunk=" + chunkX + ',' + chunkZ
+                                + " state=" + claim.state()
+                                + " routed_cells=" + routedCells
+                                + " content_invalidated=false"
+                                + " display_staled=false");
+            }
+            repaired++;
+        }
+        return repaired;
+    }
+
     private void enqueueCurrentDisplayReplacement(int chunkX, int chunkZ,
             int priority) {
         Minecraft minecraft = Minecraft.getInstance();
@@ -906,7 +1021,8 @@ public final class CavePipeline {
         telemetry.updateQueues(scheduler.queuedTaskCount()
                         + displayScheduler.queuedTaskCount()
                         + worldSaveReader.queuedCount()
-                        + worldSaveReader.inFlightCount(),
+                        + worldSaveReader.inFlightCount()
+                        + liveRepairInbox.size(),
                 textureManager.requestCount(), textureManager.pendingBuildCount(),
                 repository.loadedTileCount());
         telemetry.logIfEnabled();
@@ -920,6 +1036,40 @@ public final class CavePipeline {
         lastViewportView = null;
         lastViewportLayerY = Integer.MIN_VALUE;
         lastViewportNanos = 0L;
+    }
+
+    private static final class LiveRepairInbox {
+        private static final long NONE = Long.MIN_VALUE;
+        private static final int MAX_KEYS = 16_384;
+        private final LongArrayFIFOQueue order = new LongArrayFIFOQueue();
+        private final LongOpenHashSet queued = new LongOpenHashSet();
+
+        private synchronized boolean offer(long key) {
+            if (queued.size() >= MAX_KEYS || !queued.add(key)) return false;
+            order.enqueue(key);
+            return true;
+        }
+
+        private synchronized long poll() {
+            while (!order.isEmpty()) {
+                long key = order.dequeueLong();
+                if (queued.remove(key)) return key;
+            }
+            return NONE;
+        }
+
+        private synchronized void cancel(long key) {
+            queued.remove(key);
+        }
+
+        private synchronized int size() {
+            return queued.size();
+        }
+
+        private synchronized void clear() {
+            order.clear();
+            queued.clear();
+        }
     }
 
     private static final class LayerWarmupState {

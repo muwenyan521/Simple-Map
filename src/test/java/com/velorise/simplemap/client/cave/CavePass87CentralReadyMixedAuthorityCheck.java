@@ -7,7 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
-/** PASS87 guard for central-child publication and mixed Full source authority. */
+/** PASS87 compatibility guard updated for PASS132 archive-only authority. */
 public final class CavePass87CentralReadyMixedAuthorityCheck {
     private CavePass87CentralReadyMixedAuthorityCheck() { }
 
@@ -36,14 +36,13 @@ public final class CavePass87CentralReadyMixedAuthorityCheck {
                 "visible pages still wait for halo or submit unready foreground work");
         require(repository.contains("projectionAuthorityRevisionLocked")
                         && repository.contains("hasProjectionAuthorityPage")
-                        && repository.contains("absentMask")
                         && repository.contains("indexedProjectionMask")
-                        && repository.contains("absentDisplayTiles.containsKey(key)"),
-                "mixed archive/known-absent pages are not stable source authority");
+                        && repository.contains("archiveMask != 0xFFFF"),
+                "partial archive pages can still use weak absence as authority");
         require(archive.contains("hasIndexedCompleteChunk")
                         && archive.contains("hasIndexedFullProjectionChunk"),
                 "archive does not expose chunk-level retained authority");
-        require(style.contains("STYLE_SIGNATURE_VERSION = 19"),
+        require(style.contains("STYLE_SIGNATURE_VERSION = 20"),
                 "old incomplete cave region images remain cache-compatible");
     }
 
@@ -63,22 +62,19 @@ public final class CavePass87CentralReadyMixedAuthorityCheck {
                 "missing Full absence entries were mistaken for known-empty chunks");
         require(archive.ingest(completeTile(firstChunkX, firstChunkZ, 71L)),
                 "test archive tile was not ingested");
-        boolean[] absent = new boolean[16];
-        java.util.Arrays.fill(absent, true);
-        absent[0] = false;
-        require(repository.commitDisplayPage(List.of(), CaveView.FULL,
+        require(!repository.commitDisplayPage(List.of(), CaveView.FULL,
                         Integer.MIN_VALUE, firstChunkX, firstChunkZ,
-                        absent, generation),
-                "mixed presence transaction did not publish absences");
-        require(repository.hasProjectionAuthorityPage(CaveView.FULL,
+                        generation),
+                "weak absence transaction unexpectedly changed repository state");
+        require(!repository.hasProjectionAuthorityPage(CaveView.FULL,
                         Integer.MIN_VALUE, pageX, pageZ),
-                "one archived plus fifteen absent chunks did not form Full authority");
+                "one archived plus fifteen absent chunks formed Full authority");
         long firstRevision = repository.getPageRevision(CaveView.FULL,
                 Integer.MIN_VALUE, pageX, pageZ);
-        require(firstRevision != 0L, "mixed authority has no source revision");
+        require(firstRevision != 0L, "resident archive has no source revision");
         repository.commitDisplayPage(List.of(), CaveView.FULL,
                 Integer.MIN_VALUE, firstChunkX, firstChunkZ,
-                absent, generation);
+                generation);
         long secondRevision = repository.getPageRevision(CaveView.FULL,
                 Integer.MIN_VALUE, pageX, pageZ);
         require(firstRevision == secondRevision,

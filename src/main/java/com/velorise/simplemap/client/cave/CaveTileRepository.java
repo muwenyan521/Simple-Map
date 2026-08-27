@@ -2,15 +2,12 @@ package com.velorise.simplemap.client.cave;
 
 import com.velorise.simplemap.client.cave.archive.CaveArchiveV2Service;
 import com.velorise.simplemap.client.cave.archive.CompactCaveTile;
-import com.velorise.simplemap.client.cave.projection.CaveProjectionServiceV2;
-import com.velorise.simplemap.client.cave.projection.CaveProjectionTile;
 import com.velorise.simplemap.client.cave.v2.CaveCacheService;
 import com.velorise.simplemap.client.persistence.v2.MapPersistenceV2Service;
 import com.velorise.simplemap.client.pipeline.RevisionStamp;
 import com.velorise.simplemap.client.session.MapSessionManager;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
-import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import com.velorise.simplemap.client.CaveMode;
 import com.velorise.simplemap.client.FullCaveMapManager;
 import com.velorise.simplemap.client.MapDebugRecorder;
@@ -26,6 +23,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -40,10 +38,8 @@ public final class CaveTileRepository {
     private static final CaveTileRepository INSTANCE = new CaveTileRepository();
     private static final int MAX_LOADED_TILES = 8192;
     private static final int MAX_DISPLAY_TILES = 8192;
-    /** Sentinel outside every valid Minecraft build height. */
-    private static final int NO_ABSENT_LAYER = Integer.MAX_VALUE;
-    /* Full Cave uses Integer.MIN_VALUE as its canonical projection key, so the
-     * old MIN_VALUE default made every missing map entry look explicitly absent. */
+    /** Current, previous and two adjacent AUTO slices per chunk/band. */
+    private static final int MAX_EXACT_VARIANTS_PER_BAND = 4;
     private static final int DISPLAY_SAVE_BATCH_SIZE = 16;
     private static final int PAGE_SIZE = 64;
     private static final int PROJECTION_SIZE = PAGE_SIZE + 2;
@@ -57,8 +53,11 @@ public final class CaveTileRepository {
     private static final int MAX_PENDING_RAW_SAVE_BATCHES = 2;
     private static final int MAX_PENDING_DISPLAY_SAVE_BATCHES = 1;
     private static final int MAX_PENDING_COMPACTIONS = 1;
+    private static final int MAX_PENDING_ARCHIVE_PUBLICATIONS = 64;
     private static final long MIN_SAVE_RETRY_MS = 10L;
     private static final long MAX_SAVE_RETRY_MS = 500L;
+    private static final boolean DEBUG_TELEMETRY_DISABLED =
+            Boolean.getBoolean("simplemap.disableDebugTelemetry");
     /** Small direct-projection workspace reused by each page-build worker. */
     private static final ThreadLocal<ProjectionWorkspace> PROJECTION_WORKSPACE =
             ThreadLocal.withInitial(ProjectionWorkspace::new);
@@ -79,9 +78,6 @@ public final class CaveTileRepository {
     private final Long2IntOpenHashMap displayRegionChunkCounts = new Long2IntOpenHashMap();
     private final Long2IntOpenHashMap loadedDisplayRegionCounts = new Long2IntOpenHashMap();
     private final Set<DenseCaveTileKey> dirtyDisplayTiles = new HashSet<>();
-    /** Exact Top-Y for a known-empty projection inside a retained band. */
-    private final Object2IntOpenHashMap<DenseCaveTileKey> absentDisplayTiles =
-            new Object2IntOpenHashMap<>();
     /**
      * Soft-invalidated dense tiles remain renderable until a complete replacement
      * is committed. This mirrors Xaero's incremental map updates: refresh never
@@ -104,11 +100,28 @@ public final class CaveTileRepository {
     private final Map<Long, CaveRegionStore.RecordPointer> regionRecords = new HashMap<>();
     private final Long2LongOpenHashMap regionRevisions = new Long2LongOpenHashMap();
     private final Map<Long, CompletableFuture<?>> pendingLoads = new HashMap<>();
-    /** Indexed SMR2 source is not resident authority; visible pages refill on demand. */
-    private final Map<Long, CompletableFuture<Integer>> pendingArchivePageLoads =
+    /**
+     * Indexed SMR2 source is not resident authority. Refill is coalesced at the
+     * native 32x32-chunk container boundary because one SMR2 read already parses
+     * the complete region file.
+     */
+    private final Map<Long, CompletableFuture<Integer>> pendingArchiveRegionLoads =
             new HashMap<>();
+    /**
+     * Native SMR2 regions already probed by the lazy foreground cache path. A
+     * successful probe indexes every cave record in that region; a miss falls
+     * through to Anvil. This prevents rereading one partial/missing region every
+     * observation pulse before the old global archive index would have finished.
+     */
+    private final Set<Long> probedArchiveV2Regions = new HashSet<>();
     private final Map<Long, CompletableFuture<?>> pendingSaves = new HashMap<>();
     private final Map<Long, CompletableFuture<?>> pendingCompactions = new HashMap<>();
+    /** Lightweight snapshots waiting for variable-length compact materialization. */
+    private final Map<Long, ArchivePublicationTicket> queuedArchivePublications =
+            new LinkedHashMap<>();
+    /** At most one compact builder owns a chunk; later milestones coalesce behind it. */
+    private final Map<Long, CompletableFuture<CompactCaveTile>>
+            activeArchivePublications = new HashMap<>();
     private final Long2IntOpenHashMap regionSaveCounts = new Long2IntOpenHashMap();
     private final Map<PageCacheKey, ResolvedPage> resolvedPageCache =
             new LinkedHashMap<>(32, 0.75f, true);
@@ -117,12 +130,16 @@ public final class CaveTileRepository {
     private final AtomicLong generation = new AtomicLong(1L);
     private long nextSaveAdmissionNanos;
     private long saveRetryDelayMs = MIN_SAVE_RETRY_MS;
+    private long denseVariantTrimCalls;
+    private long denseVariantTrimKeysScanned;
+    private long denseVariantTrimTotalNanos;
+    private long denseVariantTrimMaxNanos;
+    private long denseVariantTrimNextTelemetryNanos;
     private boolean indexRebuildPending;
 
     private volatile File directory;
 
     private CaveTileRepository() {
-        absentDisplayTiles.defaultReturnValue(NO_ABSENT_LAYER);
     }
 
     public static CaveTileRepository getInstance() {
@@ -149,6 +166,7 @@ public final class CaveTileRepository {
         List<DenseCaveTile> displaySnapshots;
         List<CompletableFuture<?>> inFlight;
         List<CompletableFuture<?>> displayInFlight;
+        List<CompletableFuture<CompactCaveTile>> archiveInFlight;
         synchronized (this) {
             if (requested != null && requested.equals(directory)) return;
             previousDirectory = directory;
@@ -156,6 +174,7 @@ public final class CaveTileRepository {
             displaySnapshots = collectDirtyDisplayTilesLocked();
             inFlight = new ArrayList<>(pendingSaves.values());
             displayInFlight = new ArrayList<>(pendingDisplaySaves.values());
+            archiveInFlight = new ArrayList<>(activeArchivePublications.values());
 
             generation.incrementAndGet();
             tiles.clear();
@@ -165,19 +184,22 @@ public final class CaveTileRepository {
             displayRegionChunkCounts.clear();
             loadedDisplayRegionCounts.clear();
             dirtyDisplayTiles.clear();
-            absentDisplayTiles.clear();
             staleDisplayTiles.clear();
             displayRecords.clear();
             pendingDisplayLoads.clear();
             pendingDisplaySaves.clear();
             regionRevisions.clear();
             pendingLoads.clear();
-            pendingArchivePageLoads.clear();
+            pendingArchiveRegionLoads.clear();
+            probedArchiveV2Regions.clear();
             pendingSaves.clear();
             pendingCompactions.clear();
+            queuedArchivePublications.clear();
+            activeArchivePublications.clear();
             regionSaveCounts.clear();
             nextSaveAdmissionNanos = 0L;
             saveRetryDelayMs = MIN_SAVE_RETRY_MS;
+            resetDenseVariantTrimStatsLocked();
             resolvedPageCache.clear();
             indexedTiles.clear();
             indexedRegionCounts.clear();
@@ -195,36 +217,37 @@ public final class CaveTileRepository {
                     && indexDirectory.isDirectory();
             indexGeneration = generation.incrementAndGet();
         }
+        for (CompletableFuture<CompactCaveTile> future : archiveInFlight) {
+            if (future != null) future.cancel(false);
+        }
         flushSnapshotsAfter(previousDirectory, snapshots, inFlight);
         flushDisplayTilesAfter(previousDirectory, displaySnapshots, displayInFlight);
         scheduleIndexRebuild(indexDirectory, indexGeneration);
         if (indexDirectory != null) {
-            long worldIdentity = indexDirectory.getAbsolutePath().hashCode()
-                    * 0x9E3779B97F4A7C15L;
-            MapPersistenceV2Service.getInstance().loadCaveArchives(
-                    indexDirectory, worldIdentity, tile -> {
-                        synchronized (CaveTileRepository.this) {
-                            if (!isGenerationCurrent(indexGeneration)
-                                    || directory != indexDirectory) return;
-                        }
-                        // Startup establishes persistent identity only. Visible
-                        // pages become resident through targeted SMR2 reads instead
-                        // of filling and immediately overflowing the archive LRU.
-                        CaveArchiveV2Service.getInstance().index(tile);
-                    }).thenAccept(indexed -> {
-                        if (indexed <= 0) return;
-                        MapDebugRecorder.getInstance().event(
-                                "CAVE_ARCHIVE_PERSISTENCE_INDEX_READY",
-                                "tiles=" + indexed + " resident="
-                                        + CaveArchiveV2Service.getInstance()
-                                                .summary().tiles()
-                                        + " directory=" + indexDirectory.getName());
-                    });
+            /*
+             * PASS151: do not decode the entire persisted cave history at world open
+             * just to build an identity index. The supplied PASS149 run decoded
+             * 66,405 CompactCaveTile records and did not finish that scan until
+             * ~14.6 s, overlapping the first fullscreen Cave load. Foreground pages
+             * now probe their addressed SMR2 native region directly; the region read
+             * validates world identity and lazily installs the same fingerprints.
+             */
+            MapDebugRecorder.getInstance().event(
+                    "CAVE_ARCHIVE_PERSISTENCE_LAZY_REGION_READY",
+                    "directory=" + indexDirectory.getName()
+                            + " policy=direct_smr2_region_on_visible_demand_no_global_tile_decode"
+                            + " pass=PASS152");
         }
     }
 
     public synchronized File directory() {
         return directory;
+    }
+
+    public synchronized DenseVariantTrimStats denseVariantTrimStats() {
+        return new DenseVariantTrimStats(denseVariantTrimCalls,
+                denseVariantTrimKeysScanned, denseVariantTrimTotalNanos,
+                denseVariantTrimMaxNanos);
     }
 
     public CaveChunkTile getOrCreateLiveTile(int chunkX, int chunkZ) {
@@ -238,6 +261,20 @@ public final class CaveTileRepository {
             if (indexedTiles.contains(key)) requestTileLoadLocked(chunkX, chunkZ, key);
             return created;
         }
+    }
+
+    /**
+     * Claims a live source route without turning an authority observation into a
+     * content invalidation. Existing complete columns remain immediately usable.
+     */
+    public LiveAuthorityClaim ensureLiveAuthority(int chunkX, int chunkZ) {
+        CaveChunkTile tile = getOrCreateLiveTile(chunkX, chunkZ);
+        boolean transitioned = tile.ensureLiveAuthority();
+        return new LiveAuthorityClaim(tile, tile.liveAuthorityState(), transitioned);
+    }
+
+    public record LiveAuthorityClaim(CaveChunkTile tile,
+            CaveChunkTile.LiveAuthorityState state, boolean transitioned) {
     }
 
     public synchronized CaveChunkTile getLoadedTile(int chunkX, int chunkZ) {
@@ -263,7 +300,7 @@ public final class CaveTileRepository {
      */
     public synchronized boolean hasDisplayTileSource(CaveView view, int layerY,
             int chunkX, int chunkZ, DenseCaveTile.Source minimumSource) {
-        DenseCaveTileKey key = new DenseCaveTileKey(chunkX, chunkZ, view, layerY);
+        DenseCaveTileKey key = DenseCaveTileKey.of(chunkX, chunkZ, view, layerY);
         return hasDisplayTileSourceLocked(key, minimumSource);
     }
 
@@ -273,7 +310,7 @@ public final class CaveTileRepository {
      */
     public synchronized boolean hasFreshDisplayTileSource(CaveView view, int layerY,
             int chunkX, int chunkZ, DenseCaveTile.Source minimumSource) {
-        DenseCaveTileKey key = new DenseCaveTileKey(chunkX, chunkZ, view, layerY);
+        DenseCaveTileKey key = DenseCaveTileKey.of(chunkX, chunkZ, view, layerY);
         if (staleDisplayTiles.contains(key)) return false;
         DenseCaveTile loaded = displayTiles.get(key);
         if (loaded != null) {
@@ -288,21 +325,15 @@ public final class CaveTileRepository {
 
     /**
      * Page-reader check for one already resolved leaf. Unlike
-     * {@link #hasFreshDisplayTileSource}, an explicit empty result also counts as
-     * resolved. This lets a partially completed 4x4 page retry only its unknown
-     * chunks instead of decoding the other fifteen again.
+     * {@link #hasFreshDisplayTileSource}. A transient disk absence deliberately
+     * does not count as resolved; only a real tile can satisfy this probe.
      */
     public synchronized boolean hasFreshDisplayTileOrKnownEmpty(CaveView view,
             int layerY, int chunkX, int chunkZ,
             DenseCaveTile.Source minimumSource) {
-        int normalized = DenseCaveTile.normalizeLayer(view, layerY);
-        DenseCaveTileKey key = new DenseCaveTileKey(
-                chunkX, chunkZ, view, normalized);
+        DenseCaveTileKey key = DenseCaveTileKey.of(
+                chunkX, chunkZ, view, layerY);
         if (staleDisplayTiles.contains(key)) return false;
-        if (absentDisplayTiles.containsKey(key)
-                && absentDisplayTiles.getInt(key) == layerY) {
-            return true;
-        }
         DenseCaveTile loaded = displayTiles.get(key);
         if (loaded != null) {
             return loaded.source().rank() >= minimumSource.rank()
@@ -323,16 +354,13 @@ public final class CaveTileRepository {
      */
     public synchronized boolean hasFreshDisplayPageSource(CaveView view, int layerY,
             int globalPageX, int globalPageZ, DenseCaveTile.Source minimumSource) {
-        int normalized = DenseCaveTile.normalizeLayer(view, layerY);
         int firstChunkX = globalPageX << 2;
         int firstChunkZ = globalPageZ << 2;
         for (int localX = 0; localX < 4; localX++) {
             for (int localZ = 0; localZ < 4; localZ++) {
-                DenseCaveTileKey key = new DenseCaveTileKey(
-                        firstChunkX + localX, firstChunkZ + localZ, view, normalized);
+                DenseCaveTileKey key = DenseCaveTileKey.of(
+                        firstChunkX + localX, firstChunkZ + localZ, view, layerY);
                 if (staleDisplayTiles.contains(key)) return false;
-                if (absentDisplayTiles.containsKey(key)
-                        && absentDisplayTiles.getInt(key) == layerY) continue;
                 DenseCaveTile loaded = displayTiles.get(key);
                 if (loaded == null || loaded.source().rank() < minimumSource.rank()) return false;
                 if (view != CaveView.FULL && loaded.projectionTopY() != layerY) return false;
@@ -349,7 +377,6 @@ public final class CaveTileRepository {
      */
     public synchronized boolean isPageProjectionReady(CaveView view, int layerY,
             int globalPageX, int globalPageZ) {
-        int normalized = DenseCaveTile.normalizeLayer(view, layerY);
         int firstChunkX = globalPageX << 2;
         int firstChunkZ = globalPageZ << 2;
         CaveArchiveV2Service archiveService = CaveArchiveV2Service.getInstance();
@@ -360,10 +387,8 @@ public final class CaveTileRepository {
                 int order = localX * 4 + localZ;
                 int chunkX = firstChunkX + localX;
                 int chunkZ = firstChunkZ + localZ;
-                DenseCaveTileKey key = new DenseCaveTileKey(
-                        chunkX, chunkZ, view, normalized);
-                if (absentDisplayTiles.containsKey(key)
-                        && absentDisplayTiles.getInt(key) == layerY) continue;
+                DenseCaveTileKey key = DenseCaveTileKey.of(
+                        chunkX, chunkZ, view, layerY);
                 DenseCaveTile dense = staleDisplayTiles.contains(key)
                         ? null : displayTiles.get(key);
                 if (dense != null && (view == CaveView.FULL
@@ -377,28 +402,53 @@ public final class CaveTileRepository {
         return true;
     }
 
-    /** True while presentation-ready cache data for this page is already in IO. */
-    public synchronized boolean hasPendingDisplayPageLoad(CaveView view, int layerY,
+    /**
+     * Cheap 16-bit central-child coverage for foreground projection coalescing.
+     * Complete compact authority or any exact, non-stale Dense projection may
+     * contribute. WORLD_SAVE/DISK exact tiles are already presentation-ready and
+     * must not wait for the reusable vertical archive to become resident.
+     * Disk/header absence is deliberately absent from this identity.
+     */
+    public synchronized int projectionChildReadyMask(CaveView view, int layerY,
             int globalPageX, int globalPageZ) {
-        int normalized = DenseCaveTile.normalizeLayer(view, layerY);
+        CaveView effectiveView = view == null ? CaveView.FULL : view;
+        int mask = CaveArchiveV2Service.getInstance().residentProjectionMask(
+                globalPageX, globalPageZ, effectiveView == CaveView.FULL);
         int firstChunkX = globalPageX << 2;
         int firstChunkZ = globalPageZ << 2;
         for (int localZ = 0; localZ < 4; localZ++) {
             for (int localX = 0; localX < 4; localX++) {
-                DenseCaveTileKey key = new DenseCaveTileKey(
+                int order = localX * 4 + localZ;
+                int bit = 1 << order;
+                if ((mask & bit) != 0) continue;
+                DenseCaveTileKey key = DenseCaveTileKey.of(
                         firstChunkX + localX, firstChunkZ + localZ,
-                        view, normalized);
+                        effectiveView, layerY);
+                DenseCaveTile dense = staleDisplayTiles.contains(key)
+                        ? null : displayTiles.get(key);
+                if (dense == null) continue;
+                if (effectiveView == CaveView.LAYERED
+                        && dense.projectionTopY() != layerY) continue;
+                mask |= bit;
+            }
+        }
+        return mask;
+    }
+
+    /** True while presentation-ready cache data for this page is already in IO. */
+    public synchronized boolean hasPendingDisplayPageLoad(CaveView view, int layerY,
+            int globalPageX, int globalPageZ) {
+        int firstChunkX = globalPageX << 2;
+        int firstChunkZ = globalPageZ << 2;
+        for (int localZ = 0; localZ < 4; localZ++) {
+            for (int localX = 0; localX < 4; localX++) {
+                DenseCaveTileKey key = DenseCaveTileKey.of(
+                        firstChunkX + localX, firstChunkZ + localZ,
+                        view, layerY);
                 if (pendingDisplayLoads.containsKey(key)) return true;
             }
         }
         return false;
-    }
-
-    private void removeAbsentLayerLocked(DenseCaveTileKey key, int layerY) {
-        if (absentDisplayTiles.containsKey(key)
-                && absentDisplayTiles.getInt(key) == layerY) {
-            absentDisplayTiles.removeInt(key);
-        }
     }
 
     private boolean hasDisplayTileSourceLocked(DenseCaveTileKey key,
@@ -416,15 +466,14 @@ public final class CaveTileRepository {
      */
     public synchronized void markDisplayTileStale(CaveView view, int layerY,
             int chunkX, int chunkZ) {
-        DenseCaveTileKey key = new DenseCaveTileKey(chunkX, chunkZ, view, layerY);
+        DenseCaveTileKey key = DenseCaveTileKey.of(chunkX, chunkZ, view, layerY);
         staleDisplayTiles.add(key);
-        absentDisplayTiles.removeInt(key);
     }
 
     public synchronized boolean isDisplayTileStale(CaveView view, int layerY,
             int chunkX, int chunkZ) {
         return staleDisplayTiles.contains(
-                new DenseCaveTileKey(chunkX, chunkZ, view, layerY));
+                DenseCaveTileKey.of(chunkX, chunkZ, view, layerY));
     }
 
     /**
@@ -466,7 +515,7 @@ public final class CaveTileRepository {
                 if (keys == null) continue;
                 for (DenseCaveTileKey key : keys) {
                     if (marked >= limit) break;
-                    if (key.view() == view && key.layerY() == normalized
+                    if (key.view() == view && key.bandY() == normalized
                             && staleDisplayTiles.add(key)) marked++;
                 }
             }
@@ -480,14 +529,41 @@ public final class CaveTileRepository {
             if (!isGenerationCurrent(expectedGeneration)) return false;
             DenseCaveTileKey key = DenseCaveTileKey.of(tile);
             DenseCaveTile current = displayTiles.get(key);
-            if (current != null && current.source().rank() > tile.source().rank()) return false;
-            if (current != null && current.source() == tile.source()) {
+            /*
+             * PASS160: stale is not authority.
+             *
+             * A LIVE tile can have a stronger source rank than WORLD_SAVE while also
+             * being explicitly stale for this exact Top-Y. PASS159 rejected the
+             * snapshot replacement solely because LIVE > WORLD_SAVE. The scheduler
+             * then observed "exact presentation missing", re-leased the same already
+             * decoded source, projected it again, rejected it again, and repeated the
+             * same 7 children every ~2 s forever. A stale tile remains a visual
+             * fallback only; it must not veto a fresh replacement of lower rank.
+             */
+            boolean currentStale = current != null && staleDisplayTiles.contains(key);
+            if (current != null && !currentStale
+                    && current.source().rank() > tile.source().rank()) return false;
+            if (current != null && !currentStale
+                    && current.source() == tile.source()) {
                 if (current.revision() >= tile.revision()) return false;
                 if (current.sameProjectionContent(tile)) return false;
             }
+            if (currentStale && current.source().rank() > tile.source().rank()) {
+                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+                String eventKey = "CAVE_STALE_HIGHER_AUTHORITY_REPLACED:"
+                        + tile.chunkX() + ':' + tile.chunkZ() + ':'
+                        + tile.projectionTopY();
+                if (recorder.shouldEmitEvent(eventKey, 500L)) {
+                    recorder.event("CAVE_STALE_HIGHER_AUTHORITY_REPLACED",
+                            "chunk=" + tile.chunkX() + ',' + tile.chunkZ()
+                                    + " top_y=" + tile.projectionTopY()
+                                    + " stale_source=" + current.source()
+                                    + " replacement_source=" + tile.source()
+                                    + " policy=stale_is_fallback_not_authority"
+                                    + " pass=PASS160");
+                }
+            }
             putDisplayTileLocked(key, tile);
-            indexDisplayKeyLocked(key);
-            removeAbsentLayerLocked(key, tile.projectionTopY());
             staleDisplayTiles.remove(key);
             if (tile.source() != DenseCaveTile.Source.DISK) dirtyDisplayTiles.add(key);
             touchDisplayTileLocked(DenseCaveTileKey.of(tile), tile.revision());
@@ -498,13 +574,12 @@ public final class CaveTileRepository {
 
     /**
      * Transactionally merges the resolved leaves of one 64x64 page. Existing
-     * higher-authority LIVE tiles and unresolved leaves are retained, while known
-     * empty chunks are recorded in the same transaction. Publication therefore no
-     * longer waits for the slowest of sixteen independent source chunks.
+     * higher-authority LIVE tiles and unresolved leaves are retained. Absence is
+     * intentionally not accepted by this presentation transaction.
      */
     public synchronized boolean commitDisplayPage(List<DenseCaveTile> replacements,
             CaveView view, int layerY, int firstChunkX, int firstChunkZ,
-            boolean[] knownAbsent, long expectedGeneration) {
+            long expectedGeneration) {
         if (!isGenerationCurrent(expectedGeneration)) return false;
         int normalized = DenseCaveTile.normalizeLayer(view, layerY);
         boolean changed = false;
@@ -516,63 +591,19 @@ public final class CaveTileRepository {
                 if (tile == null || tile.view() != view || tile.layerY() != normalized) continue;
                 DenseCaveTileKey key = DenseCaveTileKey.of(tile);
                 DenseCaveTile current = displayTiles.get(key);
-                if (current != null && current.source().rank() > tile.source().rank()) continue;
-                if (current != null && current.source() == tile.source()) {
+                boolean currentStale = current != null && staleDisplayTiles.contains(key);
+                if (current != null && !currentStale
+                        && current.source().rank() > tile.source().rank()) continue;
+                if (current != null && !currentStale
+                        && current.source() == tile.source()) {
                     if (current.revision() >= tile.revision()) continue;
                     if (current.sameProjectionContent(tile)) continue;
                 }
                 putDisplayTileLocked(key, tile);
-                indexDisplayKeyLocked(key);
-                removeAbsentLayerLocked(key, tile.projectionTopY());
                 staleDisplayTiles.remove(key);
                 if (tile.source() != DenseCaveTile.Source.DISK) dirtyDisplayTiles.add(key);
                 changedChunks.put(pack(tile.chunkX(), tile.chunkZ()), tile.revision());
                 changed = true;
-            }
-        }
-
-        if (knownAbsent != null) {
-            int count = Math.min(16, knownAbsent.length);
-            for (int order = 0; order < count; order++) {
-                int localX = order / 4;
-                int localZ = order % 4;
-                int chunkX = firstChunkX + localX;
-                int chunkZ = firstChunkZ + localZ;
-                DenseCaveTileKey key = new DenseCaveTileKey(
-                        chunkX, chunkZ, view, normalized);
-                if (!knownAbsent[order]) {
-                    /*
-                     * A page transaction is admitted only after all sixteen central
-                     * chunks have resolved. Therefore false means proven present (or
-                     * retained by a stronger source), not "unknown". Clear an older
-                     * absence marker before archive projection. PASS82 left stale
-                     * KNOWN_ABSENT entries behind after an Anvil header refresh; Full
-                     * then skipped the real CompactCaveTile and published black pages.
-                     */
-                    int previousAbsent = absentDisplayTiles.getInt(key);
-                    if (absentDisplayTiles.containsKey(key)
-                            && previousAbsent == layerY) {
-                        absentDisplayTiles.removeInt(key);
-                        staleDisplayTiles.remove(key);
-                        changedChunks.put(pack(chunkX, chunkZ), System.nanoTime());
-                        changed = true;
-                    }
-                    continue;
-                }
-                DenseCaveTile current = displayTiles.get(key);
-                if (current != null && (view == CaveView.FULL
-                        || current.projectionTopY() == layerY)
-                        && current.source().rank()
-                                >= DenseCaveTile.Source.WORLD_SAVE.rank()) {
-                    continue;
-                }
-                boolean hadPreviousAbsent = absentDisplayTiles.containsKey(key);
-                int previousAbsent = absentDisplayTiles.put(key, layerY);
-                if (!hadPreviousAbsent || previousAbsent != layerY) {
-                    staleDisplayTiles.remove(key);
-                    changedChunks.put(pack(chunkX, chunkZ), System.nanoTime());
-                    changed = true;
-                }
             }
         }
 
@@ -591,7 +622,6 @@ public final class CaveTileRepository {
             for (DenseCaveTileKey key : keys) {
                 removeDisplayTileLocked(key);
                 dirtyDisplayTiles.remove(key);
-                absentDisplayTiles.removeInt(key);
                 staleDisplayTiles.remove(key);
                 indexedDisplayTiles.remove(key);
                 displayRecords.remove(key);
@@ -602,13 +632,7 @@ public final class CaveTileRepository {
 
     public synchronized void markDisplayTileAbsent(CaveView view, int layerY,
             int chunkX, int chunkZ, long expectedGeneration) {
-        if (!isGenerationCurrent(expectedGeneration)) return;
-        DenseCaveTileKey key = new DenseCaveTileKey(chunkX, chunkZ, view, layerY);
-        DenseCaveTile current = displayTiles.get(key);
-        if (current != null && (view == CaveView.FULL
-                || current.projectionTopY() == layerY)) return;
-        absentDisplayTiles.put(key, layerY);
-        touchDisplayTileLocked(key, System.nanoTime());
+        // PASS132: disk/header absence is a retry hint, never a display tile.
     }
 
     /**
@@ -705,10 +729,7 @@ public final class CaveTileRepository {
 
     public boolean commitColumn(CaveChunkTile tile, int columnIndex, CaveColumnData data) {
         boolean changed = tile.commitColumn(columnIndex, data);
-        if (changed) {
-            touch(tile.chunkX(), tile.chunkZ(), tile.revision());
-            if (tile.isComplete() || (columnIndex & 15) == 15) publishArchiveV2(tile);
-        }
+        if (changed) publishTileChanges(tile);
         return changed;
     }
 
@@ -725,11 +746,9 @@ public final class CaveTileRepository {
     }
 
     /** Publishes all deferred column commits from one scheduler burst. */
-    public void publishTileChanges(CaveChunkTile tile) {
-        if (tile != null) {
-            touch(tile.chunkX(), tile.chunkZ(), tile.revision());
-            publishArchiveV2(tile);
-        }
+    public boolean publishTileChanges(CaveChunkTile tile) {
+        return tile != null && tile.shouldPublishArchiveMilestone()
+                && publishArchiveV2(tile);
     }
 
     /**
@@ -757,41 +776,125 @@ public final class CaveTileRepository {
                 worldIdentity, compact, stamp.styleGeneration());
     }
 
-    private void publishArchiveV2(CaveChunkTile tile) {
-        if (tile == null || !tile.hasAnyScannedColumn()) return;
+    private boolean publishArchiveV2(CaveChunkTile tile) {
+        if (tile == null || !tile.hasAnyScannedColumn()) return false;
         long archiveRevision = tile.archiveRevision();
-        if (tile.archivePublicationCurrent(archiveRevision)) return;
+        if (tile.archivePublicationCurrent(archiveRevision)) return false;
+        long key = pack(tile.chunkX(), tile.chunkZ());
         File target;
+        long expectedGeneration;
         synchronized (this) {
-            // A late worker callback must not publish an orphaned tile into the
-            // directory/session that replaced its original repository generation.
-            if (tiles.get(pack(tile.chunkX(), tile.chunkZ())) != tile) return;
+            if (tiles.get(key) != tile) return false;
+            if (queuedArchivePublications.containsKey(key)
+                    || activeArchivePublications.containsKey(key)) return true;
+            if (queuedArchivePublications.size()
+                    + activeArchivePublications.size()
+                            >= MAX_PENDING_ARCHIVE_PUBLICATIONS) return false;
             target = directory;
+            expectedGeneration = generation.get();
         }
+        // CaveColumnData is immutable. This fixed-size reference snapshot is the
+        // only publication work allowed on the client lane; variable-length run
+        // arrays are materialized by the CPU worker below.
         CaveChunkTile.Snapshot snapshot = tile.snapshot();
-        CompactCaveTile compact = CompactCaveTile.fromLegacy(snapshot);
-        if (compact == null) return;
-        // The compact archive was already materialized above for persistence.
-        // Do not immediately rebuild it from the same Snapshot a second time.
-        CaveCacheService.getInstance().ingest(compact);
-        boolean persistenceDue = tile.isComplete()
-                || tile.scannedColumnCount() % 64 == 0;
         RevisionStamp stamp = MapSessionManager.getInstance().activeStamp();
+        ArchivePublicationTicket ticket = new ArchivePublicationTicket(tile,
+                snapshot, expectedGeneration, archiveRevision, tile.revision(),
+                tile.archivePublicationMilestone(), tile.scannedColumnCount(),
+                tile.isComplete() || tile.scannedColumnCount() % 64 == 0,
+                target, stamp);
+        synchronized (this) {
+            if (generation.get() != expectedGeneration || directory != target
+                    || tiles.get(key) != tile) return false;
+            if (queuedArchivePublications.containsKey(key)
+                    || activeArchivePublications.containsKey(key)) return true;
+            queuedArchivePublications.put(key, ticket);
+            pumpArchivePublicationsLocked(1);
+        }
+        return true;
+    }
+
+    /** Retries bounded worker admission without doing compact work inline. */
+    public synchronized int pumpArchivePublications(int maximum) {
+        return pumpArchivePublicationsLocked(Math.max(0, maximum));
+    }
+
+    private int pumpArchivePublicationsLocked(int maximum) {
+        int admitted = 0;
+        var iterator = queuedArchivePublications.entrySet().iterator();
+        while (admitted < maximum && iterator.hasNext()) {
+            Map.Entry<Long, ArchivePublicationTicket> entry = iterator.next();
+            long key = entry.getKey();
+            ArchivePublicationTicket ticket = entry.getValue();
+            CompletableFuture<CompactCaveTile> future =
+                    MapWorkScheduler.tryCpuFuture(MapRequestLane.BACKGROUND,
+                            MapWorkScheduler.WorkType.SOURCE_PROJECTION,
+                            MapRequestLane.BACKGROUND.priorityBase(), 16,
+                            () -> generation.get() == ticket.repositoryGeneration()
+                                    && directory == ticket.targetDirectory(),
+                            () -> CompactCaveTile.fromLegacy(ticket.snapshot()));
+            if (future == null) break;
+            iterator.remove();
+            activeArchivePublications.put(key, future);
+            future.whenComplete((compact, failure) -> completeArchivePublication(
+                    key, ticket, future, compact, failure));
+            admitted++;
+        }
+        return admitted;
+    }
+
+    private void completeArchivePublication(long key,
+            ArchivePublicationTicket ticket,
+            CompletableFuture<CompactCaveTile> future,
+            CompactCaveTile compact, Throwable failure) {
+        CaveChunkTile tile;
+        synchronized (this) {
+            if (activeArchivePublications.get(key) != future) return;
+            activeArchivePublications.remove(key);
+            tile = tiles.get(key);
+        }
+        boolean valid = failure == null && compact != null
+                && generation.get() == ticket.repositoryGeneration()
+                && directory == ticket.targetDirectory()
+                && tile == ticket.tile();
+        if (!valid) {
+            pumpArchivePublications(1);
+            return;
+        }
+
+        boolean fingerprintChanged = CaveCacheService.getInstance().ingest(compact);
+        telemetry.recordArchiveCompactPublication(fingerprintChanged);
+        tile.markArchivePublished(ticket.archiveRevision());
+        if (fingerprintChanged) {
+            touch(tile.chunkX(), tile.chunkZ(), ticket.tileRevision());
+        }
+        RevisionStamp stamp = ticket.sessionStamp();
+        File target = ticket.targetDirectory();
         if (target != null && stamp != null && stamp.isCurrent()
-                && persistenceDue) {
+                && ticket.persistenceDue()) {
             long worldIdentity = target.getAbsolutePath().hashCode()
                     * 0x9E3779B97F4A7C15L;
             MapPersistenceV2Service.getInstance().appendCave(target,
                     worldIdentity, compact, stamp.styleGeneration());
-            tile.markArchivePublished(archiveRevision);
-        } else if (!persistenceDue) {
-            // This compact-visible revision has no persistence milestone. A later
-            // scan-bounds-only revalidation should not materialize the same archive.
-            tile.markArchivePublished(archiveRevision);
         }
-        // If a persistence milestone is due but the active session/directory is not
-        // ready, deliberately leave the revision unclaimed so a later publication
-        // retries rather than silently losing the durable append.
+        if (compact.completeCoverage()) {
+            CaveNativeRegionImportService.getInstance()
+                    .acknowledgeLiveArchive(tile.chunkX(), tile.chunkZ());
+        }
+        MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+        if (recorder.shouldEmitEvent("CAVE_ARCHIVE_PUBLICATION", 250L)) {
+            recorder.event("CAVE_ARCHIVE_PUBLICATION",
+                    "chunk=" + tile.chunkX() + ',' + tile.chunkZ()
+                            + " milestone=" + ticket.milestone()
+                            + " scanned=" + ticket.scannedColumns()
+                            + " complete=" + compact.completeCoverage()
+                            + " fingerprint_changed=" + fingerprintChanged
+                            + " thread=cpu_worker");
+        }
+        // Coalesce every revision that arrived while this compact product was being
+        // built into one newest follow-up ticket.
+        if (tile.shouldPublishArchiveMilestone()) publishArchiveV2(tile);
+        pumpArchivePublications(1);
     }
 
     public CaveColumnData.Candidate getCandidate(int blockX, int blockZ,
@@ -839,29 +942,53 @@ public final class CaveTileRepository {
 
     synchronized DenseCaveTile getLoadedDisplayTile(CaveView view, int layerY,
             int chunkX, int chunkZ) {
-        return displayTiles.get(new DenseCaveTileKey(chunkX, chunkZ, view, layerY));
+        return displayTiles.get(DenseCaveTileKey.of(
+                chunkX, chunkZ, view, layerY));
+    }
+
+    /** Exact authority lookup; never returns a neighbouring slice in the band. */
+    public synchronized DenseCaveTile getExactDisplayTile(CaveView view,
+            int projectionTopY, int chunkX, int chunkZ) {
+        DenseCaveTileKey key = DenseCaveTileKey.of(
+                chunkX, chunkZ, view, projectionTopY);
+        return staleDisplayTiles.contains(key) ? null : displayTiles.get(key);
+    }
+
+    /**
+     * Visual fallback lookup for continuity only. Callers must not treat the
+     * returned tile as authority for {@code requestedTopY}.
+     */
+    public synchronized DenseCaveTile getLastGoodBandTile(CaveView view,
+            int requestedTopY, int chunkX, int chunkZ) {
+        DenseCaveTileKey requested = DenseCaveTileKey.of(
+                chunkX, chunkZ, view, requestedTopY);
+        Set<DenseCaveTileKey> keys = displayKeysByChunk.get(pack(chunkX, chunkZ));
+        if (keys == null) return null;
+        DenseCaveTile newest = null;
+        for (DenseCaveTileKey candidate : keys) {
+            if (!requested.sameBand(candidate) || candidate.equals(requested)
+                    || staleDisplayTiles.contains(candidate)) continue;
+            DenseCaveTile tile = displayTiles.get(candidate);
+            if (tile != null && (newest == null
+                    || tile.revision() > newest.revision())) newest = tile;
+        }
+        return newest;
     }
 
     synchronized boolean isCurrentDisplayTileRevision(CaveView view, int layerY,
             int chunkX, int chunkZ, long revision, DenseCaveTile.Source source) {
         DenseCaveTile current = displayTiles.get(
-                new DenseCaveTileKey(chunkX, chunkZ, view, layerY));
+                DenseCaveTileKey.of(chunkX, chunkZ, view, layerY));
         return current != null && current.revision() == revision
                 && current.source() == source;
     }
 
     private DenseCaveTile getDisplayTile(CaveView view, int layerY,
             int chunkX, int chunkZ) {
-        DenseCaveTileKey key = new DenseCaveTileKey(chunkX, chunkZ, view, layerY);
+        DenseCaveTileKey key = DenseCaveTileKey.of(chunkX, chunkZ, view, layerY);
         synchronized (this) {
             DenseCaveTile tile = staleDisplayTiles.contains(key)
                     ? null : displayTiles.get(key);
-            if (tile != null && view == CaveView.LAYERED
-                    && tile.projectionTopY() != layerY) {
-                // Same retained 16-block band, different exact slice. The caller must
-                // fall through to the vertical archive instead of sampling old pixels.
-                return null;
-            }
             if (tile == null && !displayTiles.containsKey(key)
                     && indexedDisplayTiles.contains(key)) {
                 requestDisplayTileLoadLocked(key);
@@ -914,17 +1041,16 @@ public final class CaveTileRepository {
         int firstChunkZ = (globalPageZ << 2) - 1;
         int lastChunkZ = (globalPageZ << 2) + 4;
         boolean hasDenseCacheSource = false;
-        int mismatchedLayerTiles = 0;
+        int sameBandLastGoodTiles = 0;
         synchronized (this) {
             Set<DenseCaveTileKey> requested = new HashSet<>();
             for (int chunkZ = firstChunkZ; chunkZ <= lastChunkZ; chunkZ++) {
                 for (int chunkX = firstChunkX; chunkX <= lastChunkX; chunkX++) {
-                    DenseCaveTileKey key = new DenseCaveTileKey(
-                            chunkX, chunkZ, view, normalizedLayer);
+                    DenseCaveTileKey key = DenseCaveTileKey.of(
+                            chunkX, chunkZ, view, layerY);
                     boolean stale = staleDisplayTiles.contains(key);
                     DenseCaveTile loaded = stale ? null : displayTiles.get(key);
-                    boolean exactLoaded = loaded != null && (view == CaveView.FULL
-                            || loaded.projectionTopY() == layerY);
+                    boolean exactLoaded = loaded != null;
                     boolean physicalLoaded = displayTiles.containsKey(key);
                     boolean indexedCold = !physicalLoaded
                             && indexedDisplayTiles.contains(key);
@@ -932,9 +1058,10 @@ public final class CaveTileRepository {
                     if (exactLoaded || indexedCold || pending) {
                         hasDenseCacheSource = true;
                     }
-                    if (view == CaveView.LAYERED && loaded != null
-                            && loaded.projectionTopY() != layerY) {
-                        mismatchedLayerTiles++;
+                    if (!exactLoaded && view == CaveView.LAYERED
+                            && getLastGoodBandTile(view, layerY,
+                                    chunkX, chunkZ) != null) {
+                        sameBandLastGoodTiles++;
                     }
                     if (!physicalLoaded && indexedDisplayTiles.contains(key)) {
                         requested.add(key);
@@ -944,29 +1071,26 @@ public final class CaveTileRepository {
             requestDisplayBatchLoadLocked(requested,
                     lane == null ? MapRequestLane.FULLSCREEN : lane);
         }
-        /*
-         * DenseCaveTileKey is intentionally band-normalized. A resident CVD tile for
-         * Top-Y=-13 therefore shares its key with Top-Y=-1. It is presentation cache,
-         * not authority for the new exact slice. Do not let that same-band tile block
-         * the vertical/raw archive fallback. Xaero likewise only treats the MapTile
-         * written for the requested cave start/depth as loaded source.
-         */
-        if (mismatchedLayerTiles > 0) {
+        if (sameBandLastGoodTiles > 0) {
             MapDebugRecorder recorder = MapDebugRecorder.getInstance();
-            String eventKey = "CAVE_LAYER_BAND_ALIAS_BYPASSED:" + normalizedLayer
+            String eventKey = "CAVE_DENSE_SAME_BAND_LAST_GOOD_HIT:" + normalizedLayer
                     + ':' + globalPageX + ':' + globalPageZ;
             if (recorder.shouldEmitEvent(eventKey, 500L)) {
-                recorder.event("CAVE_LAYER_BAND_ALIAS_BYPASSED",
+                recorder.event("CAVE_DENSE_SAME_BAND_LAST_GOOD_HIT",
                         "page=" + globalPageX + ',' + globalPageZ
                                 + " top_y=" + layerY
                                 + " band=" + normalizedLayer
-                                + " mismatched_tiles=" + mismatchedLayerTiles
-                                + " action=allow_exact_fallback");
+                                + " fallback_tiles=" + sameBandLastGoodTiles
+                                + " action=retain_visual_request_exact");
             }
         }
-        // The old .cvr graph is a migration/multiplayer fallback, not a second
-        // source that should race a presentation-ready exact .cvd replay.
-        if (!hasDenseCacheSource || mismatchedLayerTiles > 0) {
+        CaveArchiveV2Service archive = CaveArchiveV2Service.getInstance();
+        boolean hasCanonicalArchive = archive.residentAnyMask(
+                globalPageX, globalPageZ) != 0
+                || archive.indexedAnyMask(globalPageX, globalPageZ) != 0;
+        // A same-band visual fallback is never a reason to rehydrate raw .cvr.
+        // Exact projection will consume the canonical vertical archive when present.
+        if (!hasDenseCacheSource && !hasCanonicalArchive) {
             requestPageRangeLoad(globalPageX, globalPageX, globalPageZ, globalPageZ);
         }
     }
@@ -980,27 +1104,21 @@ public final class CaveTileRepository {
         int firstChunkZ = (Math.min(minGlobalPageZ, maxGlobalPageZ) << 2) - 1;
         int lastChunkZ = (Math.max(minGlobalPageZ, maxGlobalPageZ) << 2) + 4;
         boolean hasDenseCacheSource = false;
-        boolean hasLayerAlias = false;
         synchronized (this) {
             Set<DenseCaveTileKey> requested = new HashSet<>();
             for (int chunkZ = firstChunkZ; chunkZ <= lastChunkZ; chunkZ++) {
                 for (int chunkX = firstChunkX; chunkX <= lastChunkX; chunkX++) {
-                    DenseCaveTileKey key = new DenseCaveTileKey(
-                            chunkX, chunkZ, view, normalizedLayer);
+                    DenseCaveTileKey key = DenseCaveTileKey.of(
+                            chunkX, chunkZ, view, layerY);
                     boolean stale = staleDisplayTiles.contains(key);
                     DenseCaveTile loaded = stale ? null : displayTiles.get(key);
-                    boolean exactLoaded = loaded != null && (view == CaveView.FULL
-                            || loaded.projectionTopY() == layerY);
+                    boolean exactLoaded = loaded != null;
                     boolean physicalLoaded = displayTiles.containsKey(key);
                     boolean indexedCold = !physicalLoaded
                             && indexedDisplayTiles.contains(key);
                     boolean pending = pendingDisplayLoads.containsKey(key);
                     if (exactLoaded || indexedCold || pending) {
                         hasDenseCacheSource = true;
-                    }
-                    if (view == CaveView.LAYERED && loaded != null
-                            && loaded.projectionTopY() != layerY) {
-                        hasLayerAlias = true;
                     }
                     if (!physicalLoaded && indexedDisplayTiles.contains(key)) {
                         requested.add(key);
@@ -1010,8 +1128,22 @@ public final class CaveTileRepository {
             requestDisplayBatchLoadLocked(requested,
                     MapRequestLane.BACKGROUND);
         }
-        // Keep old .cvr history available as a multiplayer/migration fallback.
-        if (!hasDenseCacheSource || hasLayerAlias) {
+        CaveArchiveV2Service archive = CaveArchiveV2Service.getInstance();
+        boolean hasCanonicalArchive = false;
+        for (int pageZ = Math.min(minGlobalPageZ, maxGlobalPageZ);
+                pageZ <= Math.max(minGlobalPageZ, maxGlobalPageZ)
+                        && !hasCanonicalArchive; pageZ++) {
+            for (int pageX = Math.min(minGlobalPageX, maxGlobalPageX);
+                    pageX <= Math.max(minGlobalPageX, maxGlobalPageX); pageX++) {
+                if (archive.residentAnyMask(pageX, pageZ) != 0
+                        || archive.indexedAnyMask(pageX, pageZ) != 0) {
+                    hasCanonicalArchive = true;
+                    break;
+                }
+            }
+        }
+        // Keep old .cvr history only as a cold migration/multiplayer fallback.
+        if (!hasDenseCacheSource && !hasCanonicalArchive) {
             requestPageRangeLoad(minGlobalPageX, maxGlobalPageX,
                     minGlobalPageZ, maxGlobalPageZ);
         }
@@ -1096,6 +1228,32 @@ public final class CaveTileRepository {
         CaveView effectiveView = view == null ? CaveView.FULL : view;
         int normalizedLayer = DenseCaveTile.normalizeLayer(effectiveView, layerY);
         /*
+         * PASS167: once all sixteen visible leaves are resolved, exact/CIMG/branch
+         * identity must be the stable display product -- not progress inside the
+         * background all-height archive. PASS166 mixed CaveArchiveV2.pageRevision()
+         * into every exact page revision, so 64/128/192-column compact milestones
+         * changed source identity while the very same exact page was being built.
+         * The result finished a sub-millisecond build and was then discarded as
+         * CAVE_RESULT_STALE, repeatedly. Xaero mutates its writer working tile under
+         * a time budget and only exposes a retained map product; intermediate writer
+         * progress is not a new renderer source version.
+         *
+         * Zero means the page is still unresolved, in which case the mixed revision
+         * below remains useful for invalidating provisional work. A non-zero settled
+         * stamp changes only when a visible leaf/absence/Top-Y source actually changes.
+         */
+        long settledDisplayStamp = getDisplayPageResolutionStamp(
+                effectiveView, layerY, globalPageX, globalPageZ);
+        if (settledDisplayStamp != 0L) {
+            long stable = settledDisplayStamp
+                    ^ ((long) effectiveView.ordinal() << 61)
+                    ^ Long.rotateLeft((long) normalizedLayer
+                            * 0x94D049BB133111EBL, 7)
+                    ^ Long.rotateLeft((long) layerY
+                            * 0xC6BC279692B5CC83L, 31);
+            return stable == 0L ? 1L : stable;
+        }
+        /*
          * A mutation counter is not source identity. Dense keys are normalized to a
          * 16-block Layered band, so a historical write for Top-Y=-13 used to leave a
          * non-zero page revision when Top-Y=-1 had no resident source at all. That
@@ -1103,6 +1261,9 @@ public final class CaveTileRepository {
          * index could load. Fingerprint only source that can serve this exact slice.
          */
         long displayRevision = currentDisplayProjectionRevisionLocked(
+                effectiveView, normalizedLayer, layerY,
+                globalPageX, globalPageZ);
+        long liveDisplayRevision = currentLiveDisplayProjectionRevisionLocked(
                 effectiveView, normalizedLayer, layerY,
                 globalPageX, globalPageZ);
         CaveArchiveV2Service archiveService =
@@ -1122,11 +1283,13 @@ public final class CaveTileRepository {
                 globalPageZ, archiveRevision, archiveService);
         if (displayRevision == 0L && archiveRevision == 0L
                 && authoritativeRevision == 0L) return 0L;
-        long mixed = authoritativeRevision != 0L
+        long mixed = authoritativeRevision != 0L && liveDisplayRevision == 0L
                 ? authoritativeRevision
                 : displayRevision * 0xD6E8FEB86659FD93L
                         ^ Long.rotateLeft(
-                                archiveRevision * 0x9E3779B97F4A7C15L, 23);
+                                archiveRevision * 0x9E3779B97F4A7C15L, 23)
+                        ^ Long.rotateLeft(
+                                liveDisplayRevision * 0xA24BAED4963EE407L, 41);
         mixed ^= ((long) effectiveView.ordinal() << 61)
                 ^ Long.rotateLeft((long) normalizedLayer * 0x94D049BB133111EBL, 7)
                 ^ Long.rotateLeft((long) layerY * 0xC6BC279692B5CC83L, 31);
@@ -1146,16 +1309,7 @@ public final class CaveTileRepository {
                 int chunkZ = firstChunkZ + localZ;
                 int order = localX * 4 + localZ;
                 DenseCaveTileKey key = new DenseCaveTileKey(
-                        chunkX, chunkZ, view, normalizedLayer);
-                if (absentDisplayTiles.containsKey(key)
-                        && absentDisplayTiles.getInt(key) == projectionTopY) {
-                    long component = 0xA5A5A5A500000000L
-                            ^ ((long) order * 0x9E3779B97F4A7C15L);
-                    hash ^= component;
-                    hash *= 0x100000001b3L;
-                    any = true;
-                    continue;
-                }
+                        chunkX, chunkZ, view, normalizedLayer, projectionTopY);
                 DenseCaveTile dense = staleDisplayTiles.contains(key)
                         ? null : displayTiles.get(key);
                 if (dense == null || (view == CaveView.LAYERED
@@ -1179,39 +1333,51 @@ public final class CaveTileRepository {
         return hash == 0L ? 1L : hash;
     }
 
+    /**
+     * Current-session LIVE identity must remain visible even when all sixteen
+     * retained archive children exist. Otherwise the archive-only fingerprint
+     * reuses a cached resolved page and LIVE never gets a chance to revoke it.
+     */
+    private long currentLiveDisplayProjectionRevisionLocked(CaveView view,
+            int normalizedLayer, int projectionTopY, int globalPageX,
+            int globalPageZ) {
+        int firstChunkX = globalPageX << 2;
+        int firstChunkZ = globalPageZ << 2;
+        long hash = 0xcbf29ce484222325L;
+        boolean any = false;
+        for (int localZ = 0; localZ < 4; localZ++) {
+            for (int localX = 0; localX < 4; localX++) {
+                DenseCaveTileKey key = new DenseCaveTileKey(
+                        firstChunkX + localX, firstChunkZ + localZ,
+                        view, normalizedLayer, projectionTopY);
+                DenseCaveTile dense = staleDisplayTiles.contains(key)
+                        ? null : displayTiles.get(key);
+                if (dense == null || dense.source() != DenseCaveTile.Source.LIVE
+                        || view == CaveView.LAYERED
+                                && dense.projectionTopY() != projectionTopY) {
+                    continue;
+                }
+                int order = localX * 4 + localZ;
+                hash ^= dense.revision()
+                        ^ ((long) (order + 1) * 0x9E3779B97F4A7C15L);
+                hash *= 0x100000001b3L;
+                any = true;
+            }
+        }
+        return !any ? 0L : hash == 0L ? 1L : hash;
+    }
+
     private long projectionAuthorityRevisionLocked(CaveView view,
             int normalizedLayer, int projectionTopY, int globalPageX,
             int globalPageZ, long archiveRevision,
             CaveArchiveV2Service archiveService) {
         int firstChunkX = globalPageX << 2;
         int firstChunkZ = globalPageZ << 2;
-        long absentMask = 0L;
         int archiveMask = archiveService.indexedProjectionMask(
                 globalPageX, globalPageZ, view == CaveView.FULL);
-        if (archiveMask != 0xFFFF) {
-            for (int localZ = 0; localZ < 4; localZ++) {
-                for (int localX = 0; localX < 4; localX++) {
-                    int order = localX * 4 + localZ;
-                    if ((archiveMask & (1 << order)) != 0) continue;
-                    int chunkX = firstChunkX + localX;
-                    int chunkZ = firstChunkZ + localZ;
-                    DenseCaveTileKey key = new DenseCaveTileKey(
-                            chunkX, chunkZ, view, normalizedLayer);
-                    if (!absentDisplayTiles.containsKey(key)
-                            || absentDisplayTiles.getInt(key) != projectionTopY) {
-                        return 0L;
-                    }
-                    absentMask |= 1L << order;
-                }
-            }
-        }
+        if (archiveMask != 0xFFFF) return 0L;
         long authority = Long.rotateLeft(
                 archiveRevision * 0x9E3779B97F4A7C15L, 23);
-        long absenceContribution = absentMask ^ 0xC6BC279692B5CC83L;
-        absenceContribution ^= absenceContribution >>> 29;
-        absenceContribution *= 0x94D049BB133111EBL;
-        absenceContribution ^= absenceContribution >>> 31;
-        authority ^= Long.rotateLeft(absenceContribution, 11);
         return authority == 0L ? 1L : authority;
     }
 
@@ -1244,11 +1410,7 @@ public final class CaveTileRepository {
                 int chunkX = firstChunkX + localX;
                 int chunkZ = firstChunkZ + localZ;
                 DenseCaveTileKey displayKey = new DenseCaveTileKey(
-                        chunkX, chunkZ, effectiveView, normalizedLayer);
-                if (absentDisplayTiles.containsKey(displayKey)
-                        && absentDisplayTiles.getInt(displayKey) == layerY) {
-                    return true;
-                }
+                        chunkX, chunkZ, effectiveView, normalizedLayer, layerY);
                 DenseCaveTile dense = staleDisplayTiles.contains(displayKey)
                         ? null : displayTiles.get(displayKey);
                 if (dense != null && (effectiveView == CaveView.FULL
@@ -1259,6 +1421,81 @@ public final class CaveTileRepository {
             }
         }
         return false;
+    }
+
+    /**
+     * PASS151 foreground cache-first path. Unlike requestIndexedArchivePageLoad(),
+     * this does not require the old all-world CompactCaveTile index to have finished.
+     * One filesystem-addressable 32x32 SMR2 region is loaded at most once as a cold
+     * probe; ingestBatch() installs tile fingerprints/coverage lazily. Subsequent LRU
+     * refills use the indexed path below.
+     */
+    public synchronized boolean requestPersistedArchivePageLoad(CaveView view,
+            int layerY, int globalPageX, int globalPageZ, MapRequestLane lane) {
+        File target = directory;
+        if (target == null) return false;
+        CaveArchiveV2Service archiveService = CaveArchiveV2Service.getInstance();
+        if (archiveService.indexedAnyMask(globalPageX, globalPageZ) != 0) {
+            return requestIndexedArchivePageLoad(view, layerY, globalPageX,
+                    globalPageZ, lane);
+        }
+
+        int regionX = Math.floorDiv(globalPageX, 8);
+        int regionZ = Math.floorDiv(globalPageZ, 8);
+        long regionLoadKey = pack(regionX, regionZ);
+        if (pendingArchiveRegionLoads.containsKey(regionLoadKey)) return true;
+        if (probedArchiveV2Regions.contains(regionLoadKey)) return false;
+
+        MapPersistenceV2Service persistence = MapPersistenceV2Service.getInstance();
+        if (!persistence.caveArchiveRegionExists(target, regionX, regionZ)) {
+            probedArchiveV2Regions.add(regionLoadKey);
+            return false;
+        }
+
+        long expectedGeneration = generation.get();
+        long worldIdentity = target.getAbsolutePath().hashCode()
+                * 0x9E3779B97F4A7C15L;
+        MapRequestLane effectiveLane = lane == null
+                ? MapRequestLane.BACKGROUND : lane;
+        CompletableFuture<Integer> future = persistence
+                .loadCaveArchiveRegionSnapshot(target, worldIdentity, regionX, regionZ)
+                .thenApply(tiles -> {
+                    synchronized (CaveTileRepository.this) {
+                        if (!isGenerationCurrent(expectedGeneration)
+                                || directory != target) return 0;
+                    }
+                    return archiveService.ingestBatch(tiles);
+                });
+        pendingArchiveRegionLoads.put(regionLoadKey, future);
+        MapDebugRecorder.getInstance().event(
+                "CAVE_ARCHIVE_REGION_DIRECT_REHYDRATE_REQUEST",
+                "region=" + regionX + ',' + regionZ
+                        + " trigger_page=" + globalPageX + ',' + globalPageZ
+                        + " view=" + (view == null ? CaveView.FULL : view)
+                        + " top_y=" + layerY + " lane=" + effectiveLane
+                        + " policy=visible_region_file_before_anvil pass=PASS152");
+        future.whenComplete((loaded, throwable) -> {
+            synchronized (CaveTileRepository.this) {
+                if (pendingArchiveRegionLoads.get(regionLoadKey) == future) {
+                    pendingArchiveRegionLoads.remove(regionLoadKey);
+                }
+                if (isGenerationCurrent(expectedGeneration) && directory == target) {
+                    probedArchiveV2Regions.add(regionLoadKey);
+                }
+            }
+            if (!isGenerationCurrent(expectedGeneration)) return;
+            MapDebugRecorder.getInstance().event(
+                    throwable == null ? "CAVE_ARCHIVE_REGION_DIRECT_REHYDRATE_READY"
+                            : "CAVE_ARCHIVE_REGION_DIRECT_REHYDRATE_MISS",
+                    "region=" + regionX + ',' + regionZ
+                            + " trigger_page=" + globalPageX + ',' + globalPageZ
+                            + " loaded=" + (loaded == null ? 0 : loaded)
+                            + " resident_mask=0x"
+                            + Integer.toHexString(archiveService.residentAnyMask(
+                                    globalPageX, globalPageZ))
+                            + " pass=PASS152");
+        });
+        return true;
     }
 
     /**
@@ -1276,52 +1513,61 @@ public final class CaveTileRepository {
         int missingMask = indexedMask & ~residentMask;
         if (missingMask == 0) return false;
 
-        long pageKey = pack(globalPageX, globalPageZ);
-        if (pendingArchivePageLoads.containsKey(pageKey)) return true;
+        int regionX = Math.floorDiv(globalPageX, 8);
+        int regionZ = Math.floorDiv(globalPageZ, 8);
+        long regionLoadKey = pack(regionX, regionZ);
+        if (pendingArchiveRegionLoads.containsKey(regionLoadKey)) return true;
+
         long expectedGeneration = generation.get();
         long worldIdentity = target.getAbsolutePath().hashCode()
                 * 0x9E3779B97F4A7C15L;
         MapRequestLane effectiveLane = lane == null
                 ? MapRequestLane.BACKGROUND : lane;
         CompletableFuture<Integer> future = MapPersistenceV2Service.getInstance()
-                .loadCaveArchivePage(target, worldIdentity, globalPageX, globalPageZ,
-                        tile -> {
-                            synchronized (CaveTileRepository.this) {
-                                if (!isGenerationCurrent(expectedGeneration)
-                                        || directory != target) return;
-                            }
-                            archiveService.ingest(tile);
-                        });
-        pendingArchivePageLoads.put(pageKey, future);
+                .loadCaveArchiveRegionSnapshot(target, worldIdentity, regionX, regionZ)
+                .thenApply(tiles -> {
+                    synchronized (CaveTileRepository.this) {
+                        if (!isGenerationCurrent(expectedGeneration)
+                                || directory != target) return 0;
+                    }
+                    // Publish the complete persisted native region atomically. A
+                    // projection worker cannot observe 100s of intermediate page
+                    // fingerprints while this one SMR2 file is replayed.
+                    return archiveService.ingestBatch(tiles);
+                });
+        pendingArchiveRegionLoads.put(regionLoadKey, future);
         MapDebugRecorder recorder = MapDebugRecorder.getInstance();
         if (recorder.shouldEmitEvent(
-                "CAVE_ARCHIVE_PAGE_REHYDRATE_REQUEST:" + pageKey, 250L)) {
-            recorder.event("CAVE_ARCHIVE_PAGE_REHYDRATE_REQUEST",
-                    "page=" + globalPageX + ',' + globalPageZ
+                "CAVE_ARCHIVE_REGION_REHYDRATE_REQUEST:" + regionLoadKey, 250L)) {
+            recorder.event("CAVE_ARCHIVE_REGION_REHYDRATE_REQUEST",
+                    "region=" + regionX + ',' + regionZ
+                            + " trigger_page=" + globalPageX + ',' + globalPageZ
                             + " view=" + (view == null ? CaveView.FULL : view)
                             + " top_y=" + layerY + " lane=" + effectiveLane
                             + " indexed_mask=0x" + Integer.toHexString(indexedMask)
                             + " resident_mask=0x" + Integer.toHexString(residentMask)
-                            + " missing_mask=0x" + Integer.toHexString(missingMask));
+                            + " missing_mask=0x" + Integer.toHexString(missingMask)
+                            + " policy=one_smr2_read_one_atomic_archive_publish");
         }
         future.whenComplete((loaded, throwable) -> {
             synchronized (CaveTileRepository.this) {
-                if (pendingArchivePageLoads.get(pageKey) == future) {
-                    pendingArchivePageLoads.remove(pageKey);
+                if (pendingArchiveRegionLoads.get(regionLoadKey) == future) {
+                    pendingArchiveRegionLoads.remove(regionLoadKey);
                 }
             }
             if (!isGenerationCurrent(expectedGeneration)) return;
             int residentAfter = archiveService.residentAnyMask(
                     globalPageX, globalPageZ);
             String event = throwable == null && loaded != null && loaded > 0
-                    ? "CAVE_ARCHIVE_PAGE_REHYDRATE_READY"
-                    : "CAVE_ARCHIVE_PAGE_REHYDRATE_MISS";
+                    ? "CAVE_ARCHIVE_REGION_REHYDRATE_READY"
+                    : "CAVE_ARCHIVE_REGION_REHYDRATE_MISS";
             MapDebugRecorder.getInstance().event(event,
-                    "page=" + globalPageX + ',' + globalPageZ
+                    "region=" + regionX + ',' + regionZ
+                            + " trigger_page=" + globalPageX + ',' + globalPageZ
                             + " view=" + (view == null ? CaveView.FULL : view)
                             + " top_y=" + layerY + " lane=" + effectiveLane
                             + " loaded=" + (loaded == null ? 0 : loaded)
-                            + " resident_mask=0x"
+                            + " trigger_resident_mask=0x"
                             + Integer.toHexString(residentAfter));
         });
         return true;
@@ -1339,12 +1585,7 @@ public final class CaveTileRepository {
                 int chunkX = firstChunkX + localX;
                 int chunkZ = firstChunkZ + localZ;
                 DenseCaveTileKey displayKey = new DenseCaveTileKey(
-                        chunkX, chunkZ, effectiveView, normalizedLayer);
-                if (absentDisplayTiles.containsKey(displayKey)
-                        && absentDisplayTiles.getInt(displayKey) == layerY) {
-                    continue;
-                }
-
+                        chunkX, chunkZ, effectiveView, normalizedLayer, layerY);
                 DenseCaveTile dense = staleDisplayTiles.contains(displayKey)
                         ? null : displayTiles.get(displayKey);
                 if (dense != null && (effectiveView == CaveView.FULL
@@ -1354,8 +1595,58 @@ public final class CaveTileRepository {
 
                 CompactCaveTile compact = archiveService.get(chunkX, chunkZ);
                 if (compact != null && (effectiveView == CaveView.FULL
-                        ? compact.fullProjectionCoverage()
-                        : compact.completeCoverage())) {
+                        ? archiveService.hasFullProjectionChunk(chunkX, chunkZ)
+                        : archiveService.hasCompleteChunk(chunkX, chunkZ))) {
+                    continue;
+                }
+
+                CaveChunkTile raw = tiles.get(pack(chunkX, chunkZ));
+                if (raw != null && raw.isComplete()) continue;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * PASS163 source-authority probe for fullscreen Cave.
+     *
+     * <p>{@link #hasCompleteProjectionSourcePage(CaveView, int, int, int)} is a
+     * presentation/cache readiness predicate. It deliberately accepts exact DISK
+     * tiles so a warm map can be shown immediately. That predicate must not also
+     * close the saved-world source cursor: a cache-only empty page has no strong
+     * empty proof and can otherwise become a permanent scanline blocker.
+     *
+     * <p>This method only accepts exact LIVE/WORLD_SAVE dense data, a trusted
+     * current-epoch vertical archive, or a complete raw archive. DISK exact tiles
+     * remain valid visual fallback but do not suppress bounded source verification.
+     */
+    public synchronized boolean hasCurrentProjectionSourcePage(CaveView view,
+            int layerY, int globalPageX, int globalPageZ) {
+        CaveView effectiveView = view == null ? CaveView.FULL : view;
+        int normalizedLayer = DenseCaveTile.normalizeLayer(effectiveView, layerY);
+        CaveArchiveV2Service archiveService = CaveArchiveV2Service.getInstance();
+        int firstChunkX = globalPageX << 2;
+        int firstChunkZ = globalPageZ << 2;
+        for (int localZ = 0; localZ < 4; localZ++) {
+            for (int localX = 0; localX < 4; localX++) {
+                int chunkX = firstChunkX + localX;
+                int chunkZ = firstChunkZ + localZ;
+                DenseCaveTileKey displayKey = new DenseCaveTileKey(
+                        chunkX, chunkZ, effectiveView, normalizedLayer, layerY);
+                DenseCaveTile dense = staleDisplayTiles.contains(displayKey)
+                        ? null : displayTiles.get(displayKey);
+                if (dense != null
+                        && dense.source().rank() >= DenseCaveTile.Source.WORLD_SAVE.rank()
+                        && (effectiveView == CaveView.FULL
+                                || dense.projectionTopY() == layerY)) {
+                    continue;
+                }
+
+                CompactCaveTile compact = archiveService.get(chunkX, chunkZ);
+                if (compact != null && (effectiveView == CaveView.FULL
+                        ? archiveService.hasFullProjectionChunk(chunkX, chunkZ)
+                        : archiveService.hasCompleteChunk(chunkX, chunkZ))) {
                     continue;
                 }
 
@@ -1394,16 +1685,7 @@ public final class CaveTileRepository {
                 int chunkX = firstChunkX + localX;
                 int chunkZ = firstChunkZ + localZ;
                 DenseCaveTileKey key = new DenseCaveTileKey(
-                        chunkX, chunkZ, view, normalized);
-                int absentLayer = absentDisplayTiles.getInt(key);
-                if (absentDisplayTiles.containsKey(key)
-                        && absentLayer == layerY) {
-                    hash ^= 0xA5A5A5A500000000L
-                            ^ ((long) localX << 8) ^ localZ;
-                    hash *= 0x100000001b3L;
-                    continue;
-                }
-
+                        chunkX, chunkZ, view, normalized, layerY);
                 /* A stale dense leaf is not a reason to erase a complete vertical
                  * archive from the page fingerprint. PASS67 returned zero here,
                  * so the world reader re-admitted the same archive-backed page on
@@ -1443,6 +1725,131 @@ public final class CaveTileRepository {
             }
         }
         return hash == 0L ? 1L : hash;
+    }
+
+    private static int semanticOverlayCount(CompactCaveTile tile, int run) {
+        if (tile == null || run < 0) return 0;
+        int count = tile.fluidColor(run) == 0 ? 0 : 1;
+        if (tile.emissiveColor(run) != 0) count++;
+        return Math.min(DenseCaveTile.MAX_OVERLAYS, count);
+    }
+
+    private static int semanticOverlayCount(CaveColumnData column, int run) {
+        if (column == null || run < 0) return 0;
+        int count = column.fluidColor(run) == 0 ? 0 : 1;
+        if (column.emissiveColor(run) != 0) count++;
+        return Math.min(DenseCaveTile.MAX_OVERLAYS, count);
+    }
+
+    private static void copySemanticOverlay(CompactCaveTile tile, int run,
+            int layer, int[] colors, byte[] alpha, short[] y, byte[] light,
+            byte[] flags, int target) {
+        boolean hasFluid = tile.fluidColor(run) != 0;
+        boolean hasEmissive = tile.emissiveColor(run) != 0;
+        boolean fluidFirst = hasFluid && (!hasEmissive
+                || tile.fluidY(run) >= tile.emissiveY(run));
+        boolean selectFluid = hasFluid && (layer == 0
+                ? fluidFirst : !fluidFirst);
+        if (selectFluid) {
+            colors[target] = tile.fluidColor(run);
+            alpha[target] = tile.fluidAlpha(run);
+            y[target] = tile.fluidY(run);
+            light[target] = tile.fluidLight(run);
+            byte overlayFlags = DenseCaveTile.OVERLAY_FLUID;
+            if ((tile.fluidFlags(run)
+                    & CaveColumnData.FLUID_FLAG_EMISSIVE) != 0) {
+                overlayFlags |= DenseCaveTile.OVERLAY_EMISSIVE;
+            }
+            flags[target] = overlayFlags;
+            return;
+        }
+        colors[target] = tile.emissiveColor(run);
+        alpha[target] = tile.emissiveAlpha(run);
+        y[target] = tile.emissiveY(run);
+        light[target] = tile.emissiveLight(run);
+        flags[target] = DenseCaveTile.OVERLAY_EMISSIVE;
+    }
+
+    private static void copySemanticOverlay(CaveColumnData column, int run,
+            int layer, int[] colors, byte[] alpha, short[] y, byte[] light,
+            byte[] flags, int target) {
+        boolean hasFluid = column.fluidColor(run) != 0;
+        boolean hasEmissive = column.emissiveColor(run) != 0;
+        boolean fluidFirst = hasFluid && (!hasEmissive
+                || column.fluidY(run) >= column.emissiveY(run));
+        boolean selectFluid = hasFluid && (layer == 0
+                ? fluidFirst : !fluidFirst);
+        if (selectFluid) {
+            colors[target] = column.fluidColor(run);
+            alpha[target] = column.fluidAlpha(run);
+            y[target] = column.fluidY(run);
+            light[target] = column.fluidLight(run);
+            byte overlayFlags = DenseCaveTile.OVERLAY_FLUID;
+            if ((column.fluidFlags(run)
+                    & CaveColumnData.FLUID_FLAG_EMISSIVE) != 0) {
+                overlayFlags |= DenseCaveTile.OVERLAY_EMISSIVE;
+            }
+            flags[target] = overlayFlags;
+            return;
+        }
+        colors[target] = column.emissiveColor(run);
+        alpha[target] = column.emissiveAlpha(run);
+        y[target] = column.emissiveY(run);
+        light[target] = column.emissiveLight(run);
+        flags[target] = DenseCaveTile.OVERLAY_EMISSIVE;
+    }
+
+    private static boolean compactProjectionComplete(
+            CompactCaveTile tile, CaveView view) {
+        if (tile == null) return false;
+        return view == CaveView.FULL
+                ? tile.fullProjectionCoverage() : tile.completeCoverage();
+    }
+
+    private static boolean compactColumnKnown(CompactCaveTile tile, int column) {
+        if (tile == null || column < 0 || column >= CompactCaveTile.COLUMNS) {
+            return false;
+        }
+        CompactCaveTile.ColumnStatus status = tile.status(column);
+        return status != CompactCaveTile.ColumnStatus.UNKNOWN
+                && status != CompactCaveTile.ColumnStatus.CORRUPT;
+    }
+
+    private static int compactProjectionColor(CompactCaveTile tile, int run) {
+        int material = tile.materialId(run);
+        if ((tile.flags(run) & CompactCaveTile.FLAG_LEGACY_COLOR) != 0) {
+            return material == 0 ? 0 : material | 0xFF000000;
+        }
+        int hash = material * 0x9E3779B9;
+        int red = 48 + ((hash >>> 16) & 0x7F);
+        int green = 48 + ((hash >>> 8) & 0x7F);
+        int blue = 48 + (hash & 0x7F);
+        return 0xFF000000 | (blue << 16) | (green << 8) | red;
+    }
+
+    private static byte compactProjectionFlags(CompactCaveTile tile, int run) {
+        int compactFlags = tile.flags(run) & 0xFF;
+        byte denseFlags = 0;
+        boolean semanticFluid = tile.fluidColor(run) != 0;
+        boolean semanticEmissive = tile.emissiveColor(run) != 0;
+        if (!semanticFluid
+                && (compactFlags & CompactCaveTile.FLAG_WATER) != 0) {
+            denseFlags |= DenseCaveTile.FLAG_WATER;
+        }
+        if (!semanticFluid
+                && (compactFlags & CompactCaveTile.FLAG_FLUID) != 0) {
+            denseFlags |= DenseCaveTile.FLAG_FLUID;
+        }
+        if (!semanticFluid && !semanticEmissive
+                && (compactFlags & CompactCaveTile.FLAG_EMISSIVE) != 0) {
+            denseFlags |= DenseCaveTile.FLAG_EMISSIVE;
+        }
+        return denseFlags;
+    }
+
+    private static byte compactProjectionLight(CompactCaveTile tile, int run) {
+        return (byte) Math.max(Byte.toUnsignedInt(tile.blockLight(run)),
+                Byte.toUnsignedInt(tile.skyLight(run)));
     }
 
     private static void emitArchiveAuthorityCacheHit(CaveView view, int layerY,
@@ -1489,13 +1896,9 @@ public final class CaveTileRepository {
         ProjectionWorkspace workspace = PROJECTION_WORKSPACE.get();
         CaveChunkTile[] archiveTiles = workspace.pageTiles;
         DenseCaveTile[] denseTiles = workspace.displayTiles;
-        CaveProjectionTile[] archiveV2Tiles = workspace.archiveV2Tiles;
         CompactCaveTile[] compactArchiveTiles = workspace.compactArchiveTiles;
-        boolean[] knownEmptyTiles = workspace.knownEmptyTiles;
         java.util.Arrays.fill(archiveTiles, null);
         java.util.Arrays.fill(denseTiles, null);
-        java.util.Arrays.fill(archiveV2Tiles, null);
-        java.util.Arrays.fill(knownEmptyTiles, false);
 
         int firstChunkX = (globalPageX << 2) - 1;
         int firstChunkZ = (globalPageZ << 2) - 1;
@@ -1510,92 +1913,88 @@ public final class CaveTileRepository {
                     int chunkZ = firstChunkZ + dz;
                     int tileIndex = dz * DISPLAY_TILE_WINDOW + dx;
                     DenseCaveTileKey displayKey = new DenseCaveTileKey(
-                            chunkX, chunkZ, view, normalizedLayer);
+                            chunkX, chunkZ, view, normalizedLayer, layerY);
                     DenseCaveTile dense = staleDisplayTiles.contains(displayKey)
                             ? null : displayTiles.get(displayKey);
                     CaveChunkTile archive = tiles.get(pack(chunkX, chunkZ));
                     denseTiles[tileIndex] = dense;
                     archiveTiles[tileIndex] = archive;
-                    boolean knownEmpty = absentDisplayTiles.containsKey(displayKey)
-                            && absentDisplayTiles.getInt(displayKey) == layerY;
-                    knownEmptyTiles[tileIndex] = knownEmpty;
                 }
             }
             revision = getPageRevision(view, layerY, globalPageX, globalPageZ);
         }
 
         /*
-         * Fast new-layer path. The style-independent vertical archive is already
-         * resident for chunks visited by an earlier cave view. Project those 16x16
-         * chunks directly for the requested exact Top-Y instead of waiting for the
-         * world-save scheduler to manufacture another DenseCaveTile for every band.
-         * This is the key difference between a layer scrub and a cold Anvil read.
+         * PASS149: page assembly no longer materializes a complete 16x16
+         * CaveProjectionTile for every member of the 6x6 source window. A 64x64
+         * page owns sixteen central chunks and needs only a one-block border from
+         * the twenty neighbours. PASS148 projected all 36 chunks into six fresh
+         * 256-entry arrays before copying 4,356 final columns, producing tens of
+         * thousands of archive projection cache operations per viewport. Keep the
+         * compact archive itself as the immutable source and project each column
+         * directly while assembling the page. Exact LIVE/WORLD_SAVE Dense tiles are
+         * preferred because they already represent the requested view/Top-Y.
          */
         int centralArchiveAuthorityTiles = 0;
-        {
-            CaveProjectionServiceV2 projectionService =
-                    CaveProjectionServiceV2.getInstance();
-            int archiveAuthorityTiles = 0;
-            int denseFallbackTiles = 0;
-            for (int dz = 0; dz < DISPLAY_TILE_WINDOW; dz++) {
-                for (int dx = 0; dx < DISPLAY_TILE_WINDOW; dx++) {
-                    int tileIndex = dz * DISPLAY_TILE_WINDOW + dx;
-                    boolean central = dx >= 1 && dx <= 4 && dz >= 1 && dz <= 4;
-                    if (knownEmptyTiles[tileIndex]) {
-                        // A generated-index absence is as authoritative as a complete
-                        // archive tile for atomic Full-page selection.
-                        if (central) centralArchiveAuthorityTiles++;
-                        continue;
+        int archiveAuthorityTiles = 0;
+        int denseFallbackTiles = 0;
+        for (int dz = 0; dz < DISPLAY_TILE_WINDOW; dz++) {
+            for (int dx = 0; dx < DISPLAY_TILE_WINDOW; dx++) {
+                int tileIndex = dz * DISPLAY_TILE_WINDOW + dx;
+                boolean central = dx >= 1 && dx <= 4 && dz >= 1 && dz <= 4;
+                CompactCaveTile compact = compactArchiveTiles[tileIndex];
+                boolean compactComplete = compactProjectionComplete(
+                        compact, view);
+                if (compact != null) {
+                    archiveAuthorityTiles++;
+                    if (central && compactComplete) {
+                        centralArchiveAuthorityTiles++;
                     }
-                    /*
-                     * Prefer the style-independent vertical archive for both cave
-                     * views, even when a presentation-ready DenseCaveTile exists.
-                     * Old Full dense tiles encode only the first roof cavity and old
-                     * Layered tiles may contain a sky-to-surface floor. The archive
-                     * projection is deterministic, Top-Y exact and continuity-aware;
-                     * dense pixels remain the compatibility/overlay fallback.
-                     */
-                    CompactCaveTile compactArchive = compactArchiveTiles[tileIndex];
-                    archiveV2Tiles[tileIndex] = view == CaveView.FULL
-                            ? projectionService.full(compactArchive, 0L)
-                            : projectionService.layered(compactArchive,
-                                    layerY, 0L);
-                    if (archiveV2Tiles[tileIndex] != null) {
-                        archiveAuthorityTiles++;
-                        if (central && archiveV2Tiles[tileIndex].complete()) {
-                            centralArchiveAuthorityTiles++;
-                        }
-                    } else if (denseTiles[tileIndex] != null) {
-                        denseFallbackTiles++;
-                    }
+                } else if (denseTiles[tileIndex] != null) {
+                    denseFallbackTiles++;
                 }
             }
-            if (archiveAuthorityTiles > 0) {
-                MapDebugRecorder recorder = MapDebugRecorder.getInstance();
-                String eventKey = "CAVE_ARCHIVE_PROJECTION_AUTHORITY:"
-                        + view + ':' + layerY + ':' + globalPageX + ':' + globalPageZ;
-                if (recorder.shouldEmitEvent(eventKey, 500L)) {
-                    recorder.event("CAVE_ARCHIVE_PROJECTION_AUTHORITY",
-                            "page=" + globalPageX + ',' + globalPageZ
-                                    + " view=" + view + " top_y=" + layerY
-                                    + " archive_tiles=" + archiveAuthorityTiles
-                                    + " dense_fallback_tiles=" + denseFallbackTiles);
-                }
+        }
+        if (archiveAuthorityTiles > 0) {
+            MapDebugRecorder recorder = MapDebugRecorder.getInstance();
+            String eventKey = "CAVE_ARCHIVE_PROJECTION_AUTHORITY:"
+                    + view + ':' + layerY + ':' + globalPageX + ':' + globalPageZ;
+            if (recorder.shouldEmitEvent(eventKey, 500L)) {
+                recorder.event("CAVE_ARCHIVE_PROJECTION_AUTHORITY",
+                        "page=" + globalPageX + ',' + globalPageZ
+                                + " view=" + view + " top_y=" + layerY
+                                + " archive_tiles=" + archiveAuthorityTiles
+                                + " dense_fallback_tiles=" + denseFallbackTiles
+                                + " policy=direct_compact_column_no_36_tile_projection");
             }
         }
 
         complete = true;
+        boolean strongEmptyCoverage = true;
         for (int dz = 1; dz <= 4; dz++) {
             for (int dx = 1; dx <= 4; dx++) {
                 int tileIndex = dz * DISPLAY_TILE_WINDOW + dx;
                 DenseCaveTile dense = denseTiles[tileIndex];
                 boolean denseMatches = dense != null && (view == CaveView.FULL
                         || dense.projectionTopY() == layerY);
-                if (denseMatches || knownEmptyTiles[tileIndex]) continue;
-                CaveProjectionTile v2 = archiveV2Tiles[tileIndex];
-                if (v2 != null && v2.complete()) continue;
+                boolean tileComplete = denseMatches;
+                boolean tileStrong = denseMatches
+                        && dense.source() != DenseCaveTile.Source.DISK;
+                CompactCaveTile compact = compactArchiveTiles[tileIndex];
+                if (compactProjectionComplete(compact, view)) {
+                    tileComplete = true;
+                    int chunkX = firstChunkX + dx;
+                    int chunkZ = firstChunkZ + dz;
+                    tileStrong = archiveService.isStrongEmptyProofTrusted(
+                            chunkX, chunkZ);
+                }
                 CaveChunkTile archive = archiveTiles[tileIndex];
-                if (archive == null || !archive.isComplete()) complete = false;
+                if (archive != null && archive.isComplete()) {
+                    tileComplete = true;
+                    tileStrong = true;
+                }
+                if (!tileComplete) complete = false;
+                if (!tileStrong) strongEmptyCoverage = false;
             }
         }
 
@@ -1655,6 +2054,7 @@ public final class CaveTileRepository {
                         : CaveMode.getScanMinimum(level, layerY);
 
         boolean hasContent = false;
+        boolean liveAuthorityUsed = false;
         for (int targetZ = 0; targetZ < PROJECTION_SIZE; targetZ++) {
             int blockZ = borderedOriginZ + targetZ;
             int chunkZ = blockZ >> 4;
@@ -1672,6 +2072,9 @@ public final class CaveTileRepository {
                 byte flags = 0;
                 byte light = 0;
                 int denseOverlayCount = 0;
+                CompactCaveTile semanticCompact = null;
+                CaveColumnData semanticColumn = null;
+                int semanticRun = -1;
                 boolean known = false;
 
                 DenseCaveTile dense = denseTiles[tileIndex];
@@ -1679,17 +2082,41 @@ public final class CaveTileRepository {
                         || dense.projectionTopY() == layerY);
                 boolean denseRenderable = false;
                 int columnIndex = (localZ << 4) | localX;
-                CaveProjectionTile v2 = archiveV2Tiles[tileIndex];
-                if (v2 != null && v2.known(columnIndex)) {
-                    // The vertical archive owns cave-selection semantics. Dense
-                    // display tiles are presentation caches and must not override a
-                    // newer coherent Full/Layered projection.
+                CompactCaveTile compact = compactArchiveTiles[tileIndex];
+                boolean trustedDenseExact = denseExact
+                        && dense.source() != DenseCaveTile.Source.DISK;
+                if (trustedDenseExact) {
+                    // Exact LIVE/WORLD_SAVE output was built directly for this
+                    // requested view/Top-Y. Do not immediately replace it with a
+                    // second archive projection of the same 16x16 chunk.
+                    denseRenderable = true;
+                    liveAuthorityUsed |= dense.source() == DenseCaveTile.Source.LIVE;
                     known = true;
-                    color = v2.pixel(columnIndex);
-                    floor = v2.floorY(columnIndex);
-                    openTop = v2.topY(columnIndex);
-                    flags = v2.flags(columnIndex);
-                    light = v2.light(columnIndex);
+                    color = dense.baseColor(localX, localZ);
+                    floor = dense.floorY(localX, localZ);
+                    openTop = dense.topY(localX, localZ);
+                    flags = dense.flags(localX, localZ);
+                    light = dense.light(localX, localZ);
+                    denseOverlayCount = dense.overlayCount(localX, localZ);
+                } else if (compactColumnKnown(compact, columnIndex)) {
+                    // Project only the single column actually consumed by the 66x66
+                    // page. This is especially important for the 20 halo chunks,
+                    // where PASS148 built 5,120 archive columns to consume ~260.
+                    known = true;
+                    semanticCompact = compact;
+                    semanticRun = view == CaveView.FULL
+                            ? compact.firstVisibleFullRun(columnIndex)
+                            : compact.firstVisibleLayeredRun(
+                                    columnIndex, maximum, minimum);
+                    if (semanticRun >= 0) {
+                        color = compactProjectionColor(compact, semanticRun);
+                        floor = compact.floorY(semanticRun);
+                        openTop = compact.topY(semanticRun);
+                        flags = compactProjectionFlags(compact, semanticRun);
+                        light = compactProjectionLight(compact, semanticRun);
+                        denseOverlayCount = semanticOverlayCount(
+                                compact, semanticRun);
+                    }
                 } else if (denseExact) {
                     denseRenderable = true;
                     known = true;
@@ -1699,10 +2126,6 @@ public final class CaveTileRepository {
                     flags = dense.flags(localX, localZ);
                     light = dense.light(localX, localZ);
                     denseOverlayCount = dense.overlayCount(localX, localZ);
-                } else if (knownEmptyTiles[tileIndex]) {
-                    // Exact Top-Y was authoritatively read and contains no chunk.
-                    // This known zero may clear the retained page pixel.
-                    known = true;
                 } else {
                     /*
                      * Never project a DenseCaveTile from another exact Top-Y just
@@ -1729,6 +2152,14 @@ public final class CaveTileRepository {
                             // finishing exactly as it does for live/Anvil pixels.
                             flags = column.flags(run);
                             light = 15;
+                            semanticColumn = column;
+                            semanticRun = run;
+                            denseOverlayCount = semanticOverlayCount(column, run);
+                            if (denseOverlayCount > 0) {
+                                flags &= ~(DenseCaveTile.FLAG_WATER
+                                        | DenseCaveTile.FLAG_FLUID
+                                        | DenseCaveTile.FLAG_EMISSIVE);
+                            }
                         }
                     }
                 }
@@ -1743,7 +2174,7 @@ public final class CaveTileRepository {
                     topHeights[pageIndex] = openTop;
                     pixelFlags[pageIndex] = flags;
                     pixelLight[pageIndex] = light;
-                    if (denseRenderable && denseOverlayCount > 0) {
+                    if (denseOverlayCount > 0) {
                         if (overlayCounts == null) {
                             int overlayEntries = PAGE_SIZE * PAGE_SIZE
                                     * DenseCaveTile.MAX_OVERLAYS;
@@ -1762,16 +2193,26 @@ public final class CaveTileRepository {
                         int first = pageIndex * DenseCaveTile.MAX_OVERLAYS;
                         for (int layerIndex = 0; layerIndex < count; layerIndex++) {
                             int entry = first + layerIndex;
-                            overlayColors[entry] = dense.overlayColor(
-                                    localX, localZ, layerIndex);
-                            overlayAlpha[entry] = dense.overlayAlpha(
-                                    localX, localZ, layerIndex);
-                            overlayY[entry] = dense.overlayY(
-                                    localX, localZ, layerIndex);
-                            overlayLight[entry] = dense.overlayLight(
-                                    localX, localZ, layerIndex);
-                            overlayFlags[entry] = dense.overlayFlags(
-                                    localX, localZ, layerIndex);
+                            if (denseRenderable) {
+                                overlayColors[entry] = dense.overlayColor(
+                                        localX, localZ, layerIndex);
+                                overlayAlpha[entry] = dense.overlayAlpha(
+                                        localX, localZ, layerIndex);
+                                overlayY[entry] = dense.overlayY(
+                                        localX, localZ, layerIndex);
+                                overlayLight[entry] = dense.overlayLight(
+                                        localX, localZ, layerIndex);
+                                overlayFlags[entry] = dense.overlayFlags(
+                                        localX, localZ, layerIndex);
+                            } else if (semanticCompact != null) {
+                                copySemanticOverlay(semanticCompact, semanticRun,
+                                        layerIndex, overlayColors, overlayAlpha,
+                                        overlayY, overlayLight, overlayFlags, entry);
+                            } else if (semanticColumn != null) {
+                                copySemanticOverlay(semanticColumn, semanticRun,
+                                        layerIndex, overlayColors, overlayAlpha,
+                                        overlayY, overlayLight, overlayFlags, entry);
+                            }
                         }
                     }
                     if (known) knownRows[pageZ] |= 1L << pageX;
@@ -1788,11 +2229,16 @@ public final class CaveTileRepository {
                 }
             }
         }
+        CaveEmptyProof emptyProof = complete && strongEmptyCoverage && !hasContent
+                ? (liveAuthorityUsed
+                        ? CaveEmptyProof.COMPLETE_LIVE_SOURCE_EMPTY
+                        : CaveEmptyProof.COMPLETE_SAVED_SOURCE_EMPTY)
+                : CaveEmptyProof.NONE;
         ResolvedPage resolved = new ResolvedPage(
                 pixels, heights, topHeights, pixelFlags, pixelLight,
                 overlayCounts, overlayColors, overlayAlpha, overlayY,
                 overlayLight, overlayFlags, knownRows,
-                revision, hasContent, complete,
+                revision, hasContent, complete, emptyProof,
                 centralArchiveAuthorityTiles == 16);
         telemetry.recordGraphResolve(System.nanoTime() - resolveStarted);
         if (revision != 0L
@@ -1964,7 +2410,6 @@ public final class CaveTileRepository {
         loadedRawRegionCounts.clear();
         displayTiles.clear();
         dirtyDisplayTiles.clear();
-        absentDisplayTiles.clear();
         staleDisplayTiles.clear();
         pendingDisplayLoads.clear();
         pendingDisplaySaves.clear();
@@ -1976,6 +2421,7 @@ public final class CaveTileRepository {
         regionSaveCounts.clear();
         nextSaveAdmissionNanos = 0L;
         saveRetryDelayMs = MIN_SAVE_RETRY_MS;
+        resetDenseVariantTrimStatsLocked();
         if (!preserveDiskIndex) {
             deferredIndexRegionLoads.clear();
             clearDiskIndexLocked();
@@ -2007,7 +2453,6 @@ public final class CaveTileRepository {
             loadedRawRegionCounts.clear();
             displayTiles.clear();
             dirtyDisplayTiles.clear();
-            absentDisplayTiles.clear();
             staleDisplayTiles.clear();
             pendingDisplayLoads.clear();
             pendingDisplaySaves.clear();
@@ -2019,6 +2464,7 @@ public final class CaveTileRepository {
             regionSaveCounts.clear();
             nextSaveAdmissionNanos = 0L;
             saveRetryDelayMs = MIN_SAVE_RETRY_MS;
+            resetDenseVariantTrimStatsLocked();
             indexRebuildPending = false;
             deferredIndexRegionLoads.clear();
             rebuildDisplayChunkIndexLocked();
@@ -2134,8 +2580,6 @@ public final class CaveTileRepository {
                 if (!identical && (current == null
                         || current.source().rank() <= tile.source().rank())) {
                     putDisplayTileLocked(key, tile);
-                    indexDisplayKeyLocked(key);
-                    removeAbsentLayerLocked(key, tile.projectionTopY());
                     touchDisplayTileLocked(DenseCaveTileKey.of(tile), tile.revision());
                     trimDisplayTilesLocked();
                 }
@@ -2224,6 +2668,11 @@ public final class CaveTileRepository {
                             continue;
                         }
                         DenseCaveTile current = displayTiles.get(key);
+                        // Persistent DISK cache is fallback data, not a repair authority.
+                        // A stale higher-rank LIVE/WORLD_SAVE tile must be repaired by a
+                        // current source transaction rather than silently replaced by an
+                        // older disk record. PASS160's stale-rank bypass is therefore
+                        // intentionally limited to commitDisplayTile/Page().
                         if (current != null
                                 && current.source().rank() > tile.source().rank()) continue;
                         if (current != null && current.source() == tile.source()) {
@@ -2231,8 +2680,7 @@ public final class CaveTileRepository {
                             if (current.sameProjectionContent(tile)) continue;
                         }
                         putDisplayTileLocked(key, tile);
-                        indexDisplayKeyLocked(key);
-                        removeAbsentLayerLocked(key, tile.projectionTopY());
+                        staleDisplayTiles.remove(key);
                         changedPages.put(pack(tile.chunkX() >> 2, tile.chunkZ() >> 2), tile);
                     }
                     // One revision/listener notification per 64x64 page is enough;
@@ -2392,6 +2840,7 @@ public final class CaveTileRepository {
                         displayRecords.put(key, pointer);
                         indexDisplayKeyLocked(key);
                     }
+                    trimExactBandVariantsForChunkLocked(key);
                 }
                 trimDisplayTilesLocked();
             }
@@ -2784,11 +3233,14 @@ public final class CaveTileRepository {
         long chunkKey = pack(key.chunkX(), key.chunkZ());
         Set<DenseCaveTileKey> keys = displayKeysByChunk.get(chunkKey);
         if (keys == null) {
-            keys = new HashSet<>();
+            keys = new LinkedHashSet<>();
             displayKeysByChunk.put(chunkKey, keys);
             incrementRegionCount(displayRegionChunkCounts,
                     pack(key.chunkX() >> 5, key.chunkZ() >> 5));
         }
+        // Replacing an exact projection makes it the preferred local variant
+        // without walking or perturbing the global access-ordered map.
+        keys.remove(key);
         keys.add(key);
     }
 
@@ -2823,6 +3275,93 @@ public final class CaveTileRepository {
             incrementRegionCount(loadedDisplayRegionCounts,
                     pack(key.chunkX() >> 5, key.chunkZ() >> 5));
         }
+        indexDisplayKeyLocked(key);
+        trimExactBandVariantsForChunkLocked(key);
+    }
+
+    private void trimExactBandVariantsForChunkLocked(DenseCaveTileKey preferred) {
+        if (preferred == null || preferred.view() == CaveView.FULL) return;
+        long startedNanos = System.nanoTime();
+        Set<DenseCaveTileKey> chunkKeys = displayKeysByChunk.get(
+                pack(preferred.chunkX(), preferred.chunkZ()));
+        int scanned = 0;
+        int count = 0;
+        DenseCaveTileKey firstCandidate = null;
+        if (chunkKeys != null) {
+            for (DenseCaveTileKey key : chunkKeys) {
+                scanned++;
+                if (!preferred.sameBand(key) || !displayTiles.containsKey(key)) continue;
+                count++;
+                if (!preferred.equals(key)
+                        && !pendingDisplaySaves.containsKey(key)
+                        && !pendingDisplayLoads.containsKey(key)
+                        && firstCandidate == null) firstCandidate = key;
+            }
+        }
+        int residentVariants = count;
+        int removed = 0;
+        int excess = count - MAX_EXACT_VARIANTS_PER_BAND;
+        if (excess == 1 && firstCandidate != null) {
+            evictExactVariantLocked(firstCandidate);
+            removed = 1;
+        } else if (excess > 1 && firstCandidate != null) {
+            ArrayList<DenseCaveTileKey> removals = new ArrayList<>(excess);
+            for (DenseCaveTileKey key : chunkKeys) {
+                scanned++;
+                if (removals.size() >= excess) break;
+                if (!preferred.sameBand(key) || preferred.equals(key)
+                        || !displayTiles.containsKey(key)
+                        || pendingDisplaySaves.containsKey(key)
+                        || pendingDisplayLoads.containsKey(key)) continue;
+                removals.add(key);
+            }
+            for (DenseCaveTileKey key : removals) {
+                evictExactVariantLocked(key);
+                removed++;
+            }
+        }
+        recordDenseVariantTrimLocked(System.nanoTime() - startedNanos,
+                scanned, residentVariants, removed);
+    }
+
+    private void evictExactVariantLocked(DenseCaveTileKey key) {
+        removeDisplayTileLocked(key);
+        boolean unsaved = dirtyDisplayTiles.remove(key);
+        staleDisplayTiles.remove(key);
+        if (unsaved) {
+            indexedDisplayTiles.remove(key);
+            displayRecords.remove(key);
+        }
+        unindexDisplayKeyIfUnknownLocked(key);
+    }
+
+    private void recordDenseVariantTrimLocked(long elapsedNanos, int scanned,
+            int residentVariants, int removed) {
+        denseVariantTrimCalls++;
+        denseVariantTrimKeysScanned += scanned;
+        denseVariantTrimTotalNanos += elapsedNanos;
+        denseVariantTrimMaxNanos = Math.max(denseVariantTrimMaxNanos, elapsedNanos);
+        if (DEBUG_TELEMETRY_DISABLED) return;
+        long now = System.nanoTime();
+        if (now < denseVariantTrimNextTelemetryNanos) return;
+        denseVariantTrimNextTelemetryNanos = now + TimeUnit.SECONDS.toNanos(1L);
+        MapDebugRecorder.getInstance().event("CAVE_DENSE_VARIANT_TRIM_SUMMARY",
+                "calls=" + denseVariantTrimCalls
+                        + " keys_scanned=" + denseVariantTrimKeysScanned
+                        + " total_us=" + denseVariantTrimTotalNanos / 1_000L
+                        + " max_us=" + denseVariantTrimMaxNanos / 1_000L
+                        + " last_keys=" + scanned
+                        + " last_variants=" + residentVariants
+                        + " last_removed=" + removed);
+    }
+
+    private void resetDenseVariantTrimStatsLocked() {
+        denseVariantTrimCalls = 0L;
+        denseVariantTrimKeysScanned = 0L;
+        denseVariantTrimTotalNanos = 0L;
+        denseVariantTrimMaxNanos = 0L;
+        denseVariantTrimNextTelemetryNanos = System.nanoTime()
+                + TimeUnit.SECONDS.toNanos(1L);
     }
 
     private DenseCaveTile removeDisplayTileLocked(DenseCaveTileKey key) {
@@ -2918,7 +3457,11 @@ public final class CaveTileRepository {
             byte[] overlayCounts, int[] overlayColors, byte[] overlayAlpha,
             short[] overlayY, byte[] overlayLight, byte[] overlayFlags,
             long[] knownRows, long revision, boolean hasContent,
-            boolean complete, boolean archiveAuthoritative) {
+            boolean complete, CaveEmptyProof emptyProof,
+            boolean archiveAuthoritative) {
+        public ResolvedPage {
+            emptyProof = emptyProof == null ? CaveEmptyProof.NONE : emptyProof;
+        }
         public int knownColumnCount() {
             int count = 0;
             for (long row : knownRows) count += Long.bitCount(row);
@@ -2930,21 +3473,28 @@ public final class CaveTileRepository {
             long revision, boolean hasContent) {
     }
 
+    public record DenseVariantTrimStats(long calls, long keysScanned,
+            long totalNanos, long maxNanos) {
+    }
+
     private static final class ProjectionWorkspace {
         private final CaveChunkTile[] pageTiles =
                 new CaveChunkTile[DISPLAY_TILE_WINDOW * DISPLAY_TILE_WINDOW];
         private final DenseCaveTile[] displayTiles =
                 new DenseCaveTile[DISPLAY_TILE_WINDOW * DISPLAY_TILE_WINDOW];
-        private final CaveProjectionTile[] archiveV2Tiles =
-                new CaveProjectionTile[DISPLAY_TILE_WINDOW * DISPLAY_TILE_WINDOW];
         private final CompactCaveTile[] compactArchiveTiles =
                 new CompactCaveTile[DISPLAY_TILE_WINDOW * DISPLAY_TILE_WINDOW];
-        private final boolean[] knownEmptyTiles =
-                new boolean[DISPLAY_TILE_WINDOW * DISPLAY_TILE_WINDOW];
     }
 
     private record PageCacheKey(long generation, CaveView view, int layerY,
             int projectionTopY, int globalPageX, int globalPageZ, long revision) {
+    }
+
+    private record ArchivePublicationTicket(CaveChunkTile tile,
+            CaveChunkTile.Snapshot snapshot, long repositoryGeneration,
+            long archiveRevision, long tileRevision, int milestone,
+            int scannedColumns, boolean persistenceDue, File targetDirectory,
+            RevisionStamp sessionStamp) {
     }
 
     private record RepositoryIndex(

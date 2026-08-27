@@ -128,12 +128,54 @@ final class CaveTextureAtlas {
 
         int pageSize = LOD_SIZES[lod];
         int pitch = pageSize + 2;
-        int[] guttered = gutteredUploads[lod];
-        AtlasGutter.copyOnePixelBorder(pixels, pageSize, guttered);
         int atlasX = (slot % SLOT_COLUMNS) * pitch;
         int atlasY = (slot / SLOT_COLUMNS) * pitch;
-        uploader.upload(textureIds[lod], atlasX, atlasY,
-                pitch, pitch, guttered, pitch, 0, 0);
+
+        /*
+         * PASS139: DirtyPlan already computes sub-rectangles, but the old atlas
+         * method ignored them and uploaded the complete guttered page once for
+         * every dirty rectangle. A fragmented 8-rect update across four LODs could
+         * therefore issue dozens of full-page glTexSubImage2D transfers. The
+         * current log captured a 172 ms exact-upload outlier.
+         *
+         * Initial/full publication still uses one contiguous guttered transfer.
+         * Partial updates upload only the changed interior plus the affected
+         * one-pixel gutters when an edge changed.
+         */
+        if (dirty.minX() == 0 && dirty.minY() == 0
+                && dirty.maxX() == pageSize - 1
+                && dirty.maxY() == pageSize - 1) {
+            int[] guttered = gutteredUploads[lod];
+            AtlasGutter.copyOnePixelBorder(pixels, pageSize, guttered);
+            uploader.upload(textureIds[lod], atlasX, atlasY,
+                    pitch, pitch, guttered, pitch, 0, 0);
+            return;
+        }
+
+        /*
+         * PASS140: an edge update needs gutter maintenance. Multiple 1-pixel
+         * subuploads cost far more GL/PBO state changes than copying this tiny page
+         * (~17 KiB with gutter), so collapse edge-touching updates to one contiguous
+         * guttered transfer. Interior changes remain one sub-rectangle upload.
+         */
+        boolean touchesEdge = dirty.minX() == 0 || dirty.minY() == 0
+                || dirty.maxX() == pageSize - 1
+                || dirty.maxY() == pageSize - 1;
+        if (touchesEdge) {
+            int[] guttered = gutteredUploads[lod];
+            AtlasGutter.copyOnePixelBorder(pixels, pageSize, guttered);
+            uploader.upload(textureIds[lod], atlasX, atlasY,
+                    pitch, pitch, guttered, pitch, 0, 0);
+            return;
+        }
+
+        int width = dirty.maxX() - dirty.minX() + 1;
+        int height = dirty.maxY() - dirty.minY() + 1;
+        uploader.upload(textureIds[lod],
+                atlasX + 1 + dirty.minX(),
+                atlasY + 1 + dirty.minY(),
+                width, height, pixels, pageSize,
+                dirty.minX(), dirty.minY());
     }
 
     static int lodSize(int lod) {

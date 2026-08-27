@@ -11,7 +11,7 @@ import com.velorise.simplemap.client.MapConfig;
  * material rules.</p>
  */
 final class CaveProjectionStyle {
-    private static final int STYLE_SIGNATURE_VERSION = 19;
+    private static final int STYLE_SIGNATURE_VERSION = 20;
 
     private CaveProjectionStyle() {
     }
@@ -21,9 +21,8 @@ final class CaveProjectionStyle {
         hash = 31 * hash + MapConfig.terrainSlopes;
         hash = 31 * hash + MapConfig.mapColorProfile;
         hash = 31 * hash + MapConfig.blockColourMode;
-        // v19: Xaero-style first real terrain entry plus canonical water-over-floor
-        // archive material semantics. Reject derived images from the old geometry
-        // and mixed pre-lit/raw cave-water paths.
+        // v20: live and decoded archives retain floor/fluid/emissive facts
+        // separately and defer their only composition to CavePageStyler.
         return 31 * hash + STYLE_SIGNATURE_VERSION;
     }
 }

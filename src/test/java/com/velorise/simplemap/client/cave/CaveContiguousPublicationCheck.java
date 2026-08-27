@@ -3,7 +3,7 @@ package com.velorise.simplemap.client.cave;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-/** Source-level guard for bounded centre-out publication with parallel build-ahead. */
+/** Source-level guard for bounded deterministic planning with page-local publication. */
 public final class CaveContiguousPublicationCheck {
     private CaveContiguousPublicationCheck() { }
 
@@ -26,25 +26,27 @@ public final class CaveContiguousPublicationCheck {
                         && hierarchy.contains("PAGES_PER_REGION"),
                 "fullscreen source order is not deterministic top-left scanline");
         require(!manager.contains("FULLSCREEN_WAVEFRONT_GRACE_MS")
-                        && manager.contains("publicationOrdinal")
-                        && manager.contains("CAVE_PUBLICATION_WAVEFRONT_ADVANCE")
-                        && manager.contains("fullscreenPublicationPagePrepared")
-                        && manager.contains("ordinal <= planner.publicationOrdinal")
+                        && manager.contains("PASS110 / Xaero local publication")
+                        && manager.contains("bounded fixed-region build-ahead window")
+                        && manager.contains("planner.pageCursor++")
                         && manager.contains("regionExactBacklog.put(key, imported)")
-                        && manager.contains("if (planOrdinal > planner.publicationOrdinal) continue;")
-                        && manager.contains("publicationWindowStartedMs == 0L")
-                        && manager.contains("publicationAllows"),
-                "branch/exact/CIMG publication is not gated by one contiguous prepared scanline prefix");
+                        && manager.contains("isCompletionPublicationEligible")
+                        && manager.contains("same page-local atomic rule as Xaero"),
+                "fullscreen planning is not bounded/deterministic and page-local");
         require(!manager.contains("WAIT_FOR_FRONTIER")
                         && !manager.contains("advanceFullscreenPublicationFrontierLocked"),
                 "obsolete viewport-wide hard frontier returned");
-        require(regionProjection.contains("if ((request.completedMask & bit) == 0L) break;")
-                        && regionProjection.contains("if (page == null) break;"),
-                "native region foreground release can still skip an unresolved child");
+        require(regionProjection.contains(
+                                "PASS110 / Xaero page-local commit")
+                        && regionProjection.contains(
+                                "if ((request.completedMask & bit) == 0L) continue;")
+                        && regionProjection.contains("if (page == null) continue;"),
+                "native region release is no longer page-local and bounded");
         require(manager.contains("lane == MapRequestLane.FULLSCREEN")
                         && manager.contains("? 0 : (int) Math.min(420_000L"),
                 "fullscreen age promotion can still scramble wavefront priority");
-        require(reader.contains("order=viewport_scanline_sweep_top_left")
+        require(reader.contains("buildSourcePlan")
+                        && reader.contains("buildVisiblePagePlan")
                         && reader.contains("requiredForegroundDecodes")
                         && reader.contains("reserveForegroundDecodes")
                         && reader.contains("requestReservedLease"),

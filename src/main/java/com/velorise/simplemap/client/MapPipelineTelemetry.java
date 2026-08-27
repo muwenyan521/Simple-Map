@@ -1,5 +1,7 @@
 package com.velorise.simplemap.client;
 
+import com.velorise.simplemap.client.cave.CavePageHoleReason;
+
 import java.util.EnumMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
@@ -41,6 +43,18 @@ public final class MapPipelineTelemetry {
     private final AtomicLong sourceLeasesOpened = new AtomicLong();
     private final AtomicLong sourceLeasesClosed = new AtomicLong();
     private final AtomicLong sourceDecodesCancelledNoConsumers = new AtomicLong();
+    private final AtomicLong caveSourceLeaseCancelledViewportExit = new AtomicLong();
+    private final AtomicLong caveSourceLeaseCancelledGenerationSuperseded =
+            new AtomicLong();
+    private final AtomicLong caveSourceRetainedAfterViewportExit = new AtomicLong();
+    private final AtomicLong caveSourceArchiveCommittedOffscreen = new AtomicLong();
+    private final AtomicLong caveHandoffOffered = new AtomicLong();
+    private final AtomicLong caveHandoffAccepted = new AtomicLong();
+    private final AtomicLong caveHandoffRejectedSuperseded = new AtomicLong();
+    private final AtomicLong caveHandoffRejectedPlannerMismatch = new AtomicLong();
+    private final AtomicLong caveHandoffRetainedLoadingGeneration = new AtomicLong();
+    private final AtomicLongArray caveHoleReasons =
+            new AtomicLongArray(CavePageHoleReason.values().length);
     private volatile int lastRenderExactPages;
     private volatile int lastRenderBranchNodes;
     private volatile int lastRenderLegacyFallbacks;
@@ -189,6 +203,46 @@ public final class MapPipelineTelemetry {
         sourceDecodesCancelledNoConsumers.incrementAndGet();
     }
 
+    public void recordCaveSourceLeaseCancelledViewportExit() {
+        caveSourceLeaseCancelledViewportExit.incrementAndGet();
+    }
+
+    public void recordCaveSourceLeaseCancelledGenerationSuperseded(int count) {
+        if (count > 0) caveSourceLeaseCancelledGenerationSuperseded.addAndGet(count);
+    }
+
+    public void recordCaveSourceRetainedAfterViewportExit() {
+        caveSourceRetainedAfterViewportExit.incrementAndGet();
+    }
+
+    public void recordCaveSourceArchiveCommittedOffscreen() {
+        caveSourceArchiveCommittedOffscreen.incrementAndGet();
+    }
+
+    public void recordCaveHandoffOffered() {
+        caveHandoffOffered.incrementAndGet();
+    }
+
+    public void recordCaveHandoffAccepted() {
+        caveHandoffAccepted.incrementAndGet();
+    }
+
+    public void recordCaveHandoffRejectedSuperseded() {
+        caveHandoffRejectedSuperseded.incrementAndGet();
+    }
+
+    public void recordCaveHandoffRejectedPlannerMismatch() {
+        caveHandoffRejectedPlannerMismatch.incrementAndGet();
+    }
+
+    public void recordCaveHandoffRetainedLoadingGeneration() {
+        caveHandoffRetainedLoadingGeneration.incrementAndGet();
+    }
+
+    public void recordCavePageHole(CavePageHoleReason reason) {
+        if (reason != null) caveHoleReasons.incrementAndGet(reason.ordinal());
+    }
+
     public void recordStageNanos(MapPipelineStage stage, long nanos) {
         if (stage == null || nanos < 0L) return;
         int index = stage.ordinal();
@@ -243,6 +297,18 @@ public final class MapPipelineTelemetry {
         sourceLeasesOpened.set(0L);
         sourceLeasesClosed.set(0L);
         sourceDecodesCancelledNoConsumers.set(0L);
+        caveSourceLeaseCancelledViewportExit.set(0L);
+        caveSourceLeaseCancelledGenerationSuperseded.set(0L);
+        caveSourceRetainedAfterViewportExit.set(0L);
+        caveSourceArchiveCommittedOffscreen.set(0L);
+        caveHandoffOffered.set(0L);
+        caveHandoffAccepted.set(0L);
+        caveHandoffRejectedSuperseded.set(0L);
+        caveHandoffRejectedPlannerMismatch.set(0L);
+        caveHandoffRetainedLoadingGeneration.set(0L);
+        for (CavePageHoleReason reason : CavePageHoleReason.values()) {
+            caveHoleReasons.set(reason.ordinal(), 0L);
+        }
         lastRenderExactPages = 0;
         lastRenderBranchNodes = 0;
         lastRenderLegacyFallbacks = 0;
@@ -277,7 +343,15 @@ public final class MapPipelineTelemetry {
                 sourceFailed.get(), tasksCancelledBeforeRun.get(),
                 tasksCompletedButDiscarded.get(), branchUpdatesQueued.get(),
                 branchUpdatesDropped.get(), sourceLeasesOpened.get(),
-                sourceLeasesClosed.get(), sourceDecodesCancelledNoConsumers.get());
+                sourceLeasesClosed.get(), sourceDecodesCancelledNoConsumers.get(),
+                caveSourceLeaseCancelledViewportExit.get(),
+                caveSourceLeaseCancelledGenerationSuperseded.get(),
+                caveSourceRetainedAfterViewportExit.get(),
+                caveSourceArchiveCommittedOffscreen.get(),
+                caveHandoffOffered.get(), caveHandoffAccepted.get(),
+                caveHandoffRejectedSuperseded.get(),
+                caveHandoffRejectedPlannerMismatch.get(),
+                caveHandoffRetainedLoadingGeneration.get());
     }
 
     public String compactSummary() {
@@ -310,6 +384,18 @@ public final class MapPipelineTelemetry {
                 + " leases[open=" + s.sourceLeasesOpened()
                 + ",closed=" + s.sourceLeasesClosed()
                 + ",cancelNoConsumer=" + s.sourceDecodesCancelledNoConsumers() + "]"
+                + " caveSource[cancelViewport="
+                + s.caveSourceLeaseCancelledViewportExit()
+                + ",cancelGeneration="
+                + s.caveSourceLeaseCancelledGenerationSuperseded()
+                + ",retainedViewport=" + s.caveSourceRetainedAfterViewportExit()
+                + ",archiveOffscreen="
+                + s.caveSourceArchiveCommittedOffscreen() + "]"
+                + " caveHandoff[offered=" + s.caveHandoffOffered()
+                + ",accepted=" + s.caveHandoffAccepted()
+                + ",superseded=" + s.caveHandoffRejectedSuperseded()
+                + ",planner=" + s.caveHandoffRejectedPlannerMismatch()
+                + ",loading=" + s.caveHandoffRetainedLoadingGeneration() + "]"
                 + " latencyMs[read=" + averageMillis(MapPipelineStage.ANVIL_READ)
                 + ",datafix=" + averageMillis(MapPipelineStage.DATA_FIX)
                 + ",decode=" + averageMillis(MapPipelineStage.CHUNK_DECODE)
@@ -445,7 +531,16 @@ public final class MapPipelineTelemetry {
             long branchUpdatesDropped,
             long sourceLeasesOpened,
             long sourceLeasesClosed,
-            long sourceDecodesCancelledNoConsumers) {
+            long sourceDecodesCancelledNoConsumers,
+            long caveSourceLeaseCancelledViewportExit,
+            long caveSourceLeaseCancelledGenerationSuperseded,
+            long caveSourceRetainedAfterViewportExit,
+            long caveSourceArchiveCommittedOffscreen,
+            long caveHandoffOffered,
+            long caveHandoffAccepted,
+            long caveHandoffRejectedSuperseded,
+            long caveHandoffRejectedPlannerMismatch,
+            long caveHandoffRetainedLoadingGeneration) {
 
         public long viewportRequests(MapRequestLane lane) {
             return viewportRequestsByLane[safe(lane).ordinal()];

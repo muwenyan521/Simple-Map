@@ -37,7 +37,7 @@ final class LodBranchDiskCache {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final LodBranchDiskCache INSTANCE = new LodBranchDiskCache();
     private static final int MAGIC = 0x534C4F44; // SLOD
-    private static final int VERSION = 16;
+    private static final int VERSION = CaveCacheSchema.LOD_BRANCH_VERSION;
     private static final int INDEX_MAGIC = 0x534C4F49; // SLOI
     private static final int INDEX_VERSION = 2;
     private static final int PIXELS = 64 * 64;

@@ -118,15 +118,18 @@ public final class MapWorkScheduler {
     public enum WorkType {
         MINIMAP_EXACT(90, true),
         REGION_PROJECTION(88, true),
+        /*
+         * Source decode/fanout is an upstream dependency for exact/branch work.
+         * PASS138 could keep all eight CPU workers busy refining already-ready
+         * branches while visible Anvil source waited behind them. The current log
+         * shows SOURCE_QUEUE max >1 s and source fanout bursts coincident with
+         * stalls. Promote bounded source work above refinement; PASS139 separately
+         * caps source concurrency so this cannot monopolize the worker pool.
+         */
+        SOURCE_DECODE(87, false),
+        SOURCE_PROJECTION(86, false),
+        BRANCH_DERIVE(84, true),
         EXACT_BUILD(80, true),
-        SOURCE_DECODE(70, false),
-        SOURCE_PROJECTION(65, false),
-        // Visible LOD branches are the far-zoom coverage authority and take only
-        // tens of microseconds to derive. Keeping them below source decode left
-        // them queued for 9-113 seconds while the screen remained black. Treat
-        // their snapshots as viewport-scoped and place them just above exact-page
-        // refinement; off-screen dirty state remains retained by each LOD tree.
-        BRANCH_DERIVE(85, true),
         DISK_READ(40, false),
         LEGACY_BUILD(25, true),
         DISK_WRITE(15, false),
@@ -329,6 +332,17 @@ public final class MapWorkScheduler {
                         effectiveValid, runnable, attempt + 1);
             }
         }, Math.max(0L, delayMs), TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Schedules one tiny control-plane continuation without creating a private
+     * subsystem timer. This is intentionally not work admission: the continuation
+     * must still call tryCpu/tryIo and retain its own pending state when saturated.
+     */
+    public static void scheduleControl(long delayMs, Runnable runnable) {
+        if (runnable == null) return;
+        DELAYER.schedule(runnable, Math.max(0L, delayMs),
+                TimeUnit.MILLISECONDS);
     }
 
     public static void scheduleIo(long delay, TimeUnit unit,

@@ -25,6 +25,14 @@ import java.nio.ByteBuffer;
 public final class CaveAtlasPboUploader implements AutoCloseable {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final int PBO_RING_SIZE = 3;
+    /*
+     * PASS140: every exact Cave rectangle is at most 66x66 RGBA (~17 KiB).
+     * Orphaning/buffering a PBO for transfers this small adds more driver state
+     * transitions than payload and the latest run still recorded a 342 ms exact
+     * upload outlier. Keep the PBO implementation for future larger transfers, but
+     * use the direct pooled native buffer path for these tiny exact-page updates.
+     */
+    private static final int PBO_MIN_UPLOAD_BYTES = 64 * 1024;
     private static final boolean VALIDATE_GL =
             Boolean.getBoolean("simplemap.validateCaveGl");
 
@@ -50,8 +58,9 @@ public final class CaveAtlasPboUploader implements AutoCloseable {
         try {
             fillStaging(staging, source, sourceStride, sourceX, sourceY,
                     width, height);
-            boolean pbo = pboEnabled && uploadWithPbo(textureId, destinationX,
-                    destinationY, width, height, staging);
+            boolean pbo = pboEnabled && byteCount >= PBO_MIN_UPLOAD_BYTES
+                    && uploadWithPbo(textureId, destinationX,
+                            destinationY, width, height, staging);
             if (!pbo) {
                 uploadDirect(textureId, destinationX, destinationY,
                         width, height, staging);

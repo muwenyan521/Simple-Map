@@ -49,7 +49,7 @@ final class CaveArchiveProjector {
                         column.flags(run), 15);
             }
         }
-        return builder.build(snapshot.chunkX(), snapshot.chunkZ(), effectiveView,
+        return builder.buildOwned(snapshot.chunkX(), snapshot.chunkZ(), effectiveView,
                 projectionTopY, projectionTopY, snapshot.revision(), source);
     }
 

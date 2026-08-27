@@ -477,7 +477,7 @@ final class CaveDisplayScheduler {
                     task.builder = new DenseCaveTile.Builder();
                 } else {
                     DenseCaveTile seed = repository.getLoadedDisplayTile(
-                            task.key.view(), task.key.layerY(),
+                            task.key.view(), task.projectionTopY,
                             task.key.chunkX(), task.key.chunkZ());
                     if (seed == null || seed.source() != DenseCaveTile.Source.LIVE
                             || (task.key.view() != CaveView.FULL
@@ -522,26 +522,20 @@ final class CaveDisplayScheduler {
                     continue;
                 }
                 if (!task.fullProjection && !repository.isCurrentDisplayTileRevision(
-                        task.key.view(), task.key.layerY(), task.key.chunkX(),
+                        task.key.view(), task.projectionTopY, task.key.chunkX(),
                         task.key.chunkZ(), task.seedRevision, DenseCaveTile.Source.LIVE)) {
                     // A newer tile committed while this patch was being assembled.
                     // Restart from that tile instead of overwriting unrelated columns.
                     defer(task, gameTick, true);
                     continue;
                 }
-                DenseCaveTile tile = task.builder.build(task.key.chunkX(),
+                DenseCaveTile tile = task.builder.buildOwned(task.key.chunkX(),
                         task.key.chunkZ(), task.key.view(), task.key.layerY(),
                         task.projectionTopY, System.nanoTime(), DenseCaveTile.Source.LIVE);
-                DenseCaveTile current = repository.getLoadedDisplayTile(
-                        task.key.view(), task.key.layerY(), task.key.chunkX(),
-                        task.key.chunkZ());
-                boolean obsoleteFallback = task.key.view() == CaveView.LAYERED
-                        && task.projectionTopY != activeProjectionTopY;
-                boolean newerProjectionVisible = obsoleteFallback && current != null
-                        && current.projectionTopY() == activeProjectionTopY;
-                if (!newerProjectionVisible) {
-                    repository.commitDisplayTile(tile, task.repositoryGeneration);
-                }
+                // Content completed for a superseded presentation is still a valid
+                // exact product. Retain it in the bounded band LRU; the active exact
+                // key remains untouched and can consume the follow-up transaction.
+                repository.commitDisplayTile(tile, task.repositoryGeneration);
                 if (task.hasFollowUp()) {
                     task.activateFollowUp();
                     task.priority += 2_000;

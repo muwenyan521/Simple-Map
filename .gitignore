@@ -23,6 +23,7 @@ config/
 dev-audit/
 SOURCE_SHA256.txt
 collect-simplemap-debug.ps1
+*.ps1
 TotalAnalysis.md
 SIMPLE_MAP_MASTER_ROADMAP*.md
 CHANGELOG.md

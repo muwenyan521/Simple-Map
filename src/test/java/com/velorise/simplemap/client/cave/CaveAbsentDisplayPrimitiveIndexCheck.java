@@ -10,15 +10,16 @@ public final class CaveAbsentDisplayPrimitiveIndexCheck {
     public static void main(String[] args) throws Exception {
         Path source = Path.of("src/main/java/com/velorise/simplemap/client/cave/CaveTileRepository.java");
         String code = Files.readString(source);
-        require(code.contains("Object2IntOpenHashMap<DenseCaveTileKey> absentDisplayTiles"),
-                "known-empty projection index must remain primitive-int backed");
-        require(!code.contains("Map<DenseCaveTileKey, Integer> absentDisplayTiles"),
-                "boxed known-empty projection map must not return");
-        require(code.contains("absentDisplayTiles.getInt(key)"),
-                "render hot path must use primitive getInt lookups");
-        require(code.contains("Long2ObjectOpenHashMap<Long2LongOpenHashMap>")
-                        && code.contains("namespaceRevisions.addTo(pack("),
-                "projection-scoped page revisions must remain primitive-backed");
+        require(!code.contains("absentDisplayTiles"),
+                "transient disk absence must not have a presentation index");
+        String proof = Files.readString(Path.of(
+                "src/main/java/com/velorise/simplemap/client/cave/CaveEmptyProof.java"));
+        require(proof.contains("COMPLETE_SAVED_SOURCE_EMPTY")
+                        && proof.contains("COMPLETE_LIVE_SOURCE_EMPTY"),
+                "proof-bearing empty authority is missing");
+        require(code.contains("Long2LongOpenHashMap regionRevisions")
+                        && code.contains("regionRevisions.addTo(pack("),
+                "region source revisions must remain primitive-backed");
         require(code.contains("Long2IntOpenHashMap displayRegionChunkCounts"),
                 "Cave region-presence indexes must remain primitive");
         System.out.println("CAVE_ABSENT_DISPLAY_PRIMITIVE_INDEX_PASS");

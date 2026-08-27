@@ -86,7 +86,6 @@ public final class CaveProjectionServiceV2 {
     public synchronized int activateLayeredTopY(int topY) {
         Integer previous = activeLayeredTopYByDimension.put(activeDimension, topY);
         if (previous != null && previous == topY) return 0;
-        cacheEpoch++;
         int normalizedBand = Math.floorDiv(topY, 16) * 16;
         return layeredCache.retainExactProjectionForBand(activeDimension,
                 normalizedBand, topY);
@@ -308,13 +307,18 @@ public final class CaveProjectionServiceV2 {
         tops[column] = tile.topY(run);
         int compactFlags = tile.flags(run) & 0xFF;
         byte denseFlags = 0;
-        if ((compactFlags & CompactCaveTile.FLAG_WATER) != 0) {
+        boolean semanticFluid = tile.fluidColor(run) != 0;
+        boolean semanticEmissive = tile.emissiveColor(run) != 0;
+        if (!semanticFluid
+                && (compactFlags & CompactCaveTile.FLAG_WATER) != 0) {
             denseFlags |= DenseCaveTile.FLAG_WATER;
         }
-        if ((compactFlags & CompactCaveTile.FLAG_FLUID) != 0) {
+        if (!semanticFluid
+                && (compactFlags & CompactCaveTile.FLAG_FLUID) != 0) {
             denseFlags |= DenseCaveTile.FLAG_FLUID;
         }
-        if ((compactFlags & CompactCaveTile.FLAG_EMISSIVE) != 0) {
+        if (!semanticFluid && !semanticEmissive
+                && (compactFlags & CompactCaveTile.FLAG_EMISSIVE) != 0) {
             denseFlags |= DenseCaveTile.FLAG_EMISSIVE;
         }
         flags[column] = denseFlags;

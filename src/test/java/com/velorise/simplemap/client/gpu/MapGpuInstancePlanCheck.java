@@ -1,6 +1,7 @@
 package com.velorise.simplemap.client.gpu;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.Random;
 import java.util.Set;
@@ -54,6 +55,7 @@ public final class MapGpuInstancePlanCheck {
         randomizedStableOrdering();
 
         Set<String> fields = Arrays.stream(MapGpuInstancePlan.class.getDeclaredFields())
+                .filter(field -> !Modifier.isStatic(field.getModifiers()))
                 .map(Field::getName).collect(Collectors.toSet());
         require(fields.equals(Set.of("keys", "phases", "rects",
                         "localUvs", "requiredCoverageMasks", "size")),

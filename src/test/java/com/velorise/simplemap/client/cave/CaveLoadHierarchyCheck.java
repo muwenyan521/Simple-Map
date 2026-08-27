@@ -2,7 +2,6 @@ package com.velorise.simplemap.client.cave;
 
 import com.velorise.simplemap.client.MapRequestLane;
 
-import java.util.Map;
 import java.util.Set;
 
 /** Dependency-free ordering invariants for fixed-region cave streaming. */
@@ -35,7 +34,8 @@ public final class CaveLoadHierarchyCheck {
                 CaveLoadHierarchy.pack(0, 0),
                 CaveLoadHierarchy.pack(8, 8));
         long[] filtered = CaveLoadHierarchy.retainPresentPages(plan, present);
-        Map<Long, Integer> ordinals = CaveLoadHierarchy.buildOrdinalIndex(plan);
+        CaveLoadHierarchy.OrdinalIndex ordinals =
+                CaveLoadHierarchy.buildOrdinalIndex(plan);
         require(filtered.length == present.size(),
                 "Anvil presence filter retained empty viewport pages");
         int previousOrdinal = -1;
@@ -111,8 +111,8 @@ public final class CaveLoadHierarchyCheck {
                 minX, maxX, minZ, maxZ, centerX, centerZ, true);
         int expected = (maxX - minX + 1) * (maxZ - minZ + 1);
         require(plan.length == expected, "visible plan size changed");
-        Map<Long, Integer> ordinals = CaveLoadHierarchy.buildOrdinalIndex(plan);
-        require(ordinals.size() == expected, "duplicate visible page");
+        CaveLoadHierarchy.OrdinalIndex ordinals =
+                CaveLoadHierarchy.buildOrdinalIndex(plan);
 
         for (int ordinal = 0; ordinal < plan.length; ordinal++) {
             long page = plan[ordinal];
@@ -121,7 +121,7 @@ public final class CaveLoadHierarchyCheck {
             require(CaveLoadHierarchy.scanlineOrdinal(
                     minX, maxX, minZ, maxZ, x, z) == ordinal,
                     "fullscreen viewport scanline ordinal mismatch");
-            require(ordinals.get(page) == ordinal,
+            require(ordinals.getOrDefault(page, -1) == ordinal,
                     "wavefront ordinal index mismatch");
         }
 

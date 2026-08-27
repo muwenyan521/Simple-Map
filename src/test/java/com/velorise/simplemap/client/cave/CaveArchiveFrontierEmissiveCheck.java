@@ -42,14 +42,15 @@ public final class CaveArchiveFrontierEmissiveCheck {
         require(projection.contains("FOREGROUND_RELEASE_SLICE = 64")
                         && projection.contains(
                                 "CAVE_REGION_FOREGROUND_FRONTIER_READY")
-                                                                        && projection.contains("order=viewport_scanline_sweep_top_left")
+                        && projection.contains("order=page_local_priority_ack")
                         && projection.contains("if ((request.completedMask & bit) == 0L)")
                         && projection.contains("int[] pixelsUnsafe()")
                         && projection.contains("long[] knownRowsUnsafe()"),
                 "foreground region release lacks deterministic scanline publication");
 
-        require(manager.contains("long stageDeadline = System.nanoTime()")
-                        && manager.contains("1_250_000L")
+        require(manager.contains(
+                                "long stageDeadline = Math.min(deadline, stageStarted + localSlice)")
+                        && manager.contains("fullscreenActive ? 900_000L : 450_000L")
                         && manager.contains("imported.pixelsUnsafe()")
                         && manager.contains("imported.knownRowsUnsafe()")
                         && manager.contains(
@@ -58,19 +59,21 @@ public final class CaveArchiveFrontierEmissiveCheck {
 
         require(decoded.contains("boolean runHadEmissive = false;")
                         && decoded.contains("int runEmissiveColor = 0;")
-                        && decoded.contains("blendArchiveEmissive")
+                        && decoded.contains("runFluidAlpha")
+                        && decoded.contains("FLUID_FLAG_EMISSIVE")
+                        && !decoded.contains("blendArchiveEmissive")
                         && decoded.contains("openVisual.emissive()")
-                        && decoded.contains("fluidFlags |= CaveColumnData.FLAG_EMISSIVE")
+                        && decoded.contains("runFluidEmissive = true")
                         && decoded.contains("flags |= CaveColumnData.FLAG_EMISSIVE"),
                 "vertical cave archive still discards emissive cave features");
 
-        require(lod.contains("cave_v11_")
-                        && cimg.contains("private static final int VERSION = 8;")
+        require(lod.contains("cave_v12_")
+                        && cimg.contains("private static final int VERSION = 9;")
                         && archiveStore.contains(
-                                "private static final int REGION_VERSION = 5;")
+                                "private static final int REGION_VERSION = 6;")
                         && archiveStore.contains(
-                                "private static final int SNAPSHOT_VERSION = 8;")
-                        && style.contains("STYLE_SIGNATURE_VERSION = 19")
+                                "private static final int SNAPSHOT_VERSION = 9;")
+                        && style.contains("STYLE_SIGNATURE_VERSION = 20")
                         && style.contains(
                                 "return 31 * hash + STYLE_SIGNATURE_VERSION;"),
                 "cave source/presentation cache namespaces were not isolated");
