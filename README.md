@@ -2,7 +2,8 @@
 
 Simple Map focuses on readable terrain, fast client-side exploration, practical navigation tools, and an optional Map Book system for sharing explored regions without turning the interface into a separate game.
 
-> **Development status:** active development. The current codebase is a major rewrite of the original public version, with a new chunk-stream scanner, cave-layer mapping, texture-aware colour processing, and a reworked rendering pipeline.
+> [!WARNING]
+> **Development Paused** — This project is currently on hold. The cave mapping system proved more complex than anticipated, and further development has been postponed indefinitely. The mod is stable, fully functional for surface mapping, and remains available under the **MIT License** — forks and contributions are welcome.
 
 > **Architecture checkpoint:** V17.8 / M4 Region LOD authority. Surface far-zoom coverage can now be projected directly from region source data, published through a durable 8×8 hierarchy, and rendered as a coarse underlay before exact pages finish. The older factor-2 LOD tree remains temporarily as a quality/refinement adapter until the M5 page-table renderer replaces both paths.
 
