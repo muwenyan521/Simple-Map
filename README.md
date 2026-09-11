@@ -2,12 +2,24 @@
 
 Simple Map focuses on readable terrain, fast client-side exploration, practical navigation tools, and an optional Map Book system for sharing explored regions without turning the interface into a separate game.
 
-> [!WARNING]
-> **Development Paused** — This project is currently on hold. The cave mapping system proved more complex than anticipated, and further development has been postponed indefinitely. The mod is stable, fully functional for surface mapping, and remains available under the **MIT License** — forks and contributions are welcome.
+> **Fork maintenance** — This repository is an independent maintenance fork of Simple Map.
+> The original upstream project is paused. This fork currently prioritises reproducible
+> builds, Surface map stability, and documented releases. Cave mapping remains experimental
+> until it passes repeatable real-client validation. The original history and copyright are
+> retained, and the project remains available under the **MIT License**.
 
 > **Architecture checkpoint:** V17.8 / M4 Region LOD authority. Surface far-zoom coverage can now be projected directly from region source data, published through a durable 8×8 hierarchy, and rendered as a coarse underlay before exact pages finish. The older factor-2 LOD tree remains temporarily as a quality/refinement adapter until the M5 page-table renderer replaces both paths.
 
 > **PASS99 loaded/loading checkpoint:** minimap Surface/Cave now keep retained root coverage behind refinement and gate front/back FBO handoff like Xaero's loaded/loading grids. Cave branch work uses foreground/background dirty lanes rather than viewport queue sorting, and projection/page styling removes several high-rate transient allocations.
+
+---
+
+## Fork maintenance
+
+This is an independent maintenance fork. Build, verification, known architecture baseline,
+and release rules are documented in [DEVELOPMENT.md](DEVELOPMENT.md). Contributions should
+follow [CONTRIBUTING.md](CONTRIBUTING.md). Surface mapping is the current stability target;
+Cave mapping remains experimental until it has repeatable real-client coverage.
 
 ---
 
@@ -309,4 +321,3 @@ Development run configurations:
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 Copyright © 2026 Velorise.
-

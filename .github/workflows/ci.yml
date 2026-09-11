@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and focused checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make wrapper executable
+        run: chmod +x gradlew
+
+      - name: Build
+        run: ./gradlew build --no-daemon
+
+      - name: Run focused architecture checks
+        run: >-
+          ./gradlew
+          m2m4CoreCheck
+          architectureStackCheck
+          caveProjectionSemanticsCheck
+          retainedViewportCompositionCheck
+          framePacingHardGateCheck
+          --no-daemon
+
+  architecture-baseline:
+    name: Aggregate architecture baseline (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make wrapper executable
+        run: chmod +x gradlew
+
+      - name: Run aggregate gate
+        run: ./gradlew architectureAllCheck --no-daemon
+
+      - name: Explain known baseline status
+        if: failure()
+        run: |
+          echo "::warning title=Known baseline failure::architectureAllCheck currently fails at caveContiguousPublicationCheck; see DEVELOPMENT.md."
